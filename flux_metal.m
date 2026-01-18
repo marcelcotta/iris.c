@@ -690,3 +690,238 @@ void flux_metal_attention(float *out,
         memcpy(out, [bufOut contents], sizeOut);
     }
 }
+
+/* ========================================================================
+ * GPU Tensor API Implementation
+ * ======================================================================== */
+
+/* Internal tensor structure */
+struct flux_gpu_tensor {
+    id<MTLBuffer> buffer;
+    size_t num_elements;
+    int has_pending_work;  /* Flag to track if GPU work is pending */
+};
+
+/* Pending command buffer for batched operations */
+static id<MTLCommandBuffer> g_tensor_cmd = nil;
+static int g_tensor_batch_mode = 0;
+
+flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements) {
+    if (!g_initialized || !data || num_elements == 0) return NULL;
+
+    @autoreleasepool {
+        size_t size = num_elements * sizeof(float);
+
+        /* Get buffer from pool */
+        id<MTLBuffer> buf = pool_get_buffer(size);
+        if (!buf) return NULL;
+
+        /* Copy data to buffer (shared memory - this is fast on Apple Silicon) */
+        memcpy([buf contents], data, size);
+
+        /* Allocate tensor structure */
+        flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
+        if (!tensor) {
+            pool_release_buffer(buf);
+            return NULL;
+        }
+
+        tensor->buffer = buf;
+        tensor->num_elements = num_elements;
+        tensor->has_pending_work = 0;
+
+        return tensor;
+    }
+}
+
+flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements) {
+    if (!g_initialized || num_elements == 0) return NULL;
+
+    @autoreleasepool {
+        size_t size = num_elements * sizeof(float);
+
+        /* Get buffer from pool */
+        id<MTLBuffer> buf = pool_get_buffer(size);
+        if (!buf) return NULL;
+
+        /* Allocate tensor structure */
+        flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
+        if (!tensor) {
+            pool_release_buffer(buf);
+            return NULL;
+        }
+
+        tensor->buffer = buf;
+        tensor->num_elements = num_elements;
+        tensor->has_pending_work = 0;
+
+        return tensor;
+    }
+}
+
+void flux_gpu_tensor_read(flux_gpu_tensor_t tensor, float *out) {
+    if (!tensor || !out) return;
+
+    /* If there's pending work, sync first */
+    if (tensor->has_pending_work) {
+        flux_gpu_sync();
+        tensor->has_pending_work = 0;
+    }
+
+    /* Copy from shared memory buffer */
+    size_t size = tensor->num_elements * sizeof(float);
+    memcpy(out, [tensor->buffer contents], size);
+}
+
+float *flux_gpu_tensor_data(flux_gpu_tensor_t tensor) {
+    if (!tensor) return NULL;
+    return (float *)[tensor->buffer contents];
+}
+
+void flux_gpu_tensor_free(flux_gpu_tensor_t tensor) {
+    if (!tensor) return;
+
+    /* Release buffer back to pool */
+    pool_release_buffer(tensor->buffer);
+    tensor->buffer = nil;
+
+    free(tensor);
+}
+
+size_t flux_gpu_tensor_size(flux_gpu_tensor_t tensor) {
+    if (!tensor) return 0;
+    return tensor->num_elements;
+}
+
+void flux_gpu_sync(void) {
+    if (!g_initialized) return;
+
+    @autoreleasepool {
+        if (g_tensor_cmd) {
+            [g_tensor_cmd commit];
+            [g_tensor_cmd waitUntilCompleted];
+            g_tensor_cmd = nil;
+        }
+    }
+}
+
+void flux_gpu_batch_begin(void) {
+    if (!g_initialized || g_tensor_batch_mode) return;
+
+    @autoreleasepool {
+        g_tensor_cmd = [g_queue commandBuffer];
+        g_tensor_batch_mode = 1;
+    }
+}
+
+void flux_gpu_batch_end(void) {
+    if (!g_initialized || !g_tensor_batch_mode) return;
+
+    @autoreleasepool {
+        if (g_tensor_cmd) {
+            [g_tensor_cmd commit];
+            [g_tensor_cmd waitUntilCompleted];
+            g_tensor_cmd = nil;
+        }
+        g_tensor_batch_mode = 0;
+    }
+}
+
+/* Get or create command buffer for tensor operations */
+static id<MTLCommandBuffer> get_tensor_cmd(void) {
+    if (g_tensor_batch_mode && g_tensor_cmd) {
+        return g_tensor_cmd;
+    }
+    return [g_queue commandBuffer];
+}
+
+flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
+                                   const float *W, const float *b,
+                                   int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !x || !W) return NULL;
+
+    @autoreleasepool {
+        size_t out_elements = (size_t)seq_len * out_dim;
+        flux_gpu_tensor_t out = flux_gpu_tensor_alloc(out_elements);
+        if (!out) return NULL;
+
+        /* Get weight buffer (cached) */
+        size_t sizeW = (size_t)out_dim * in_dim * sizeof(float);
+        id<MTLBuffer> bufW = get_cached_weight_buffer(W, sizeW);
+        if (!bufW) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        /* Create matrix descriptors
+         * x: [seq_len, in_dim]
+         * W: [out_dim, in_dim] (need to transpose for x @ W^T)
+         * out: [seq_len, out_dim]
+         */
+        MPSMatrixDescriptor *descX = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:in_dim
+                            rowBytes:in_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:out_dim columns:in_dim
+                            rowBytes:in_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:out_dim
+                            rowBytes:out_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+
+        MPSMatrix *matX = [[MPSMatrix alloc] initWithBuffer:x->buffer descriptor:descX];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer descriptor:descOut];
+
+        /* Create matmul: out = x @ W^T */
+        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
+            initWithDevice:g_device
+               transposeLeft:NO
+              transposeRight:YES
+                  resultRows:seq_len
+               resultColumns:out_dim
+             interiorColumns:in_dim
+                       alpha:1.0f
+                        beta:0.0f];
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        [matmul encodeToCommandBuffer:cmdBuffer
+                           leftMatrix:matX
+                          rightMatrix:matW
+                         resultMatrix:matOut];
+
+        /* Add bias if present */
+        if (b != NULL) {
+            /* For now, sync and add bias on CPU (can optimize later with compute shader) */
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+
+            float *out_data = (float *)[out->buffer contents];
+            for (int i = 0; i < seq_len; i++) {
+                for (int j = 0; j < out_dim; j++) {
+                    out_data[i * out_dim + j] += b[j];
+                }
+            }
+            out->has_pending_work = 0;
+        } else {
+            /* Mark output as having pending work */
+            out->has_pending_work = 1;
+
+            if (!g_tensor_batch_mode) {
+                /* Not in batch mode - sync immediately */
+                [cmdBuffer commit];
+                [cmdBuffer waitUntilCompleted];
+                out->has_pending_work = 0;
+            }
+        }
+
+        /* Mark input as having pending work if in batch mode */
+        if (g_tensor_batch_mode) {
+            x->has_pending_work = 1;
+        }
+
+        return out;
+    }
+}

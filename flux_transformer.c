@@ -734,9 +734,11 @@ static void swiglu_ffn(float *out, const float *x,
     float *gate = (float *)malloc(seq * mlp_hidden * sizeof(float));
     float *up = (float *)malloc(seq * mlp_hidden * sizeof(float));
 
-    /* Gate and up projections */
+    /* Gate and up projections - these are independent, batch them */
+    flux_gpu_begin_batch();
     flux_linear_nobias(gate, x, gate_weight, seq, hidden, mlp_hidden);
     flux_linear_nobias(up, x, up_weight, seq, hidden, mlp_hidden);
+    flux_gpu_end_batch();
 
     /* SiLU(gate) * up */
     flux_silu(gate, seq * mlp_hidden);
@@ -823,14 +825,17 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     }
 #endif
 
-    /* Separate Q, K, V projections (fixes interleaved output bug) */
+    /* Separate Q, K, V projections (fixes interleaved output bug)
+     * Note: These 3 projections are independent - batch them for GPU efficiency */
     float *img_q = tf->work2;
     float *img_k = img_q + img_seq * hidden;
     float *img_v = img_k + img_seq * hidden;
 
+    flux_gpu_begin_batch();
     flux_linear_nobias(img_q, img_norm, block->img_q_weight, img_seq, hidden, hidden);
     flux_linear_nobias(img_k, img_norm, block->img_k_weight, img_seq, hidden, hidden);
     flux_linear_nobias(img_v, img_norm, block->img_v_weight, img_seq, hidden, hidden);
+    flux_gpu_end_batch();
 
     /* Apply QK normalization (per-head RMSNorm) */
     apply_qk_norm(img_q, img_k, block->img_norm_q_weight, block->img_norm_k_weight,
@@ -855,14 +860,17 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     float *txt_norm = img_norm + img_seq * hidden;
     apply_adaln(txt_norm, txt_hidden, txt_shift1, txt_scale1, txt_seq, hidden, eps);
 
-    /* Separate Q, K, V projections for text */
+    /* Separate Q, K, V projections for text
+     * Note: These 3 projections are independent - batch them for GPU efficiency */
     float *txt_q = img_v + img_seq * hidden;  /* After img_v */
     float *txt_k = txt_q + txt_seq * hidden;
     float *txt_v = txt_k + txt_seq * hidden;
 
+    flux_gpu_begin_batch();
     flux_linear_nobias(txt_q, txt_norm, block->txt_q_weight, txt_seq, hidden, hidden);
     flux_linear_nobias(txt_k, txt_norm, block->txt_k_weight, txt_seq, hidden, hidden);
     flux_linear_nobias(txt_v, txt_norm, block->txt_v_weight, txt_seq, hidden, hidden);
+    flux_gpu_end_batch();
 
     /* Apply QK normalization */
     apply_qk_norm(txt_q, txt_k, block->txt_norm_q_weight, block->txt_norm_k_weight,
@@ -891,14 +899,17 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     }
 #endif
 
-    /* Project attention output */
+    /* Project attention output
+     * Note: img_proj and txt_proj are independent - batch them for GPU efficiency */
     float *img_proj = tf->work1;
     float *txt_proj = img_proj + img_seq * hidden;
 
+    flux_gpu_begin_batch();
     flux_linear_nobias(img_proj, img_attn_out, block->img_proj_weight,
                        img_seq, hidden, hidden);
     flux_linear_nobias(txt_proj, txt_attn_out, block->txt_proj_weight,
                        txt_seq, hidden, hidden);
+    flux_gpu_end_batch();
 
 #ifdef DEBUG_DOUBLE_BLOCK
     if (block_idx == 0) {

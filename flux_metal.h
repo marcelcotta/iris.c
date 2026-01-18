@@ -87,6 +87,87 @@ int flux_metal_in_batch(void);
  */
 size_t flux_metal_memory_used(void);
 
+/* ========================================================================
+ * GPU Tensor API - Keep activations on GPU between operations
+ * ======================================================================== */
+
+/*
+ * Opaque handle to a GPU-resident tensor.
+ * Tensors are backed by pooled Metal buffers with shared storage mode,
+ * allowing zero-copy access from both CPU and GPU on Apple Silicon.
+ */
+typedef struct flux_gpu_tensor *flux_gpu_tensor_t;
+
+/*
+ * Create a GPU tensor from CPU data.
+ * Data is copied to GPU (or just referenced in shared memory mode).
+ * Returns NULL on failure.
+ */
+flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements);
+
+/*
+ * Create an uninitialized GPU tensor (for output buffers).
+ */
+flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements);
+
+/*
+ * Copy tensor data back to CPU.
+ * Waits for any pending GPU operations on this tensor.
+ */
+void flux_gpu_tensor_read(flux_gpu_tensor_t tensor, float *out);
+
+/*
+ * Get direct pointer to tensor data (shared memory mode).
+ * WARNING: Caller must ensure no GPU operations are pending on this tensor.
+ * On Apple Silicon unified memory, this provides zero-copy access.
+ */
+float *flux_gpu_tensor_data(flux_gpu_tensor_t tensor);
+
+/*
+ * Release a GPU tensor back to the pool.
+ */
+void flux_gpu_tensor_free(flux_gpu_tensor_t tensor);
+
+/*
+ * Get tensor element count.
+ */
+size_t flux_gpu_tensor_size(flux_gpu_tensor_t tensor);
+
+/* ========================================================================
+ * GPU Operations on Tensors - Operations that keep data on GPU
+ * ======================================================================== */
+
+/*
+ * Linear layer on GPU: out = x @ W^T + b (if b != NULL)
+ * x: [seq_len, in_dim]
+ * W: [out_dim, in_dim]
+ * b: [out_dim] (can be NULL)
+ * out: [seq_len, out_dim]
+ *
+ * Returns a new GPU tensor with the result.
+ * Does NOT sync - GPU operation is queued.
+ */
+flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
+                                   const float *W, const float *b,
+                                   int seq_len, int in_dim, int out_dim);
+
+/*
+ * Sync all pending GPU operations.
+ * Call this before reading tensor data or at step boundaries.
+ */
+void flux_gpu_sync(void);
+
+/*
+ * Begin a batch of GPU operations.
+ * Operations are encoded but not executed until flux_gpu_batch_end().
+ */
+void flux_gpu_batch_begin(void);
+
+/*
+ * End batch and execute all queued operations.
+ */
+void flux_gpu_batch_end(void);
+
 /*
  * GPU-accelerated scaled dot-product attention.
  * Computes attention for all heads in a single GPU batch.

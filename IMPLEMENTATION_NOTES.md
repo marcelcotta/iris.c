@@ -983,3 +983,30 @@ This reduces sync overhead from 48+ CPU BLAS calls to just 2 GPU syncs per atten
 - Implement persistent GPU activations to keep tensors on GPU between operations
 - This is the key to achieving real speedup (avoid CPU-GPU copies for every operation)
 
+### 2024-01-19: GPU Tensor API and Linear Batching
+
+**Added:**
+- GPU tensor API in `flux_metal.m` / `flux_metal.h`:
+  - `flux_gpu_tensor_create()` / `flux_gpu_tensor_alloc()` - create GPU tensors
+  - `flux_gpu_tensor_read()` / `flux_gpu_tensor_data()` - access tensor data
+  - `flux_gpu_tensor_free()` - release tensor
+  - `flux_gpu_linear()` - GPU linear layer on tensor handles
+  - `flux_gpu_batch_begin()` / `flux_gpu_batch_end()` / `flux_gpu_sync()` - batching control
+- Batched independent linear projections in `flux_transformer.c`:
+  - QKV projections for image stream (3 matmuls batched)
+  - QKV projections for text stream (3 matmuls batched)
+  - Output projections for img/txt (2 matmuls batched)
+  - Gate/up projections in FFN (2 matmuls batched)
+
+**Implementation notes:**
+- GPU tensors use pooled Metal buffers with SharedStorageMode (unified memory on Apple Silicon)
+- Batching independent linear operations reduces GPU sync overhead
+- The GPU tensor API is designed to enable future persistent activation patterns
+
+**Tests:** MPS and BLAS both pass reference comparison (max diff: 1.0, mean: 0.0001)
+
+**What's needed for further speedup:**
+- Move CPU operations (RMSNorm, RoPE, SiLU, softmax) to Metal compute shaders
+- Implement true pipelined execution (defer sync until step/block boundaries)
+- Consider bf16 inference for 2x memory bandwidth improvement
+
