@@ -208,7 +208,9 @@ typedef struct flux_transformer {
     float *attn_k_t;                /* [max_seq, hidden] transposed K */
     float *attn_v_t;                /* [max_seq, hidden] transposed V */
     float *attn_out_t;              /* [max_seq, hidden] transposed output */
-    float *attn_scores;             /* [max_seq, max_seq] attention scores */
+    float *attn_scores;             /* [num_heads, seq, seq] attention scores (BLAS/Metal only) */
+    size_t attn_scores_alloc;       /* Currently allocated size in bytes */
+    int work_seq_alloc;             /* Currently allocated sequence length for work buffers */
     float *attn_cat_k;              /* [max_seq, hidden] concatenated K */
     float *attn_cat_v;              /* [max_seq, hidden] concatenated V */
 
@@ -231,10 +233,211 @@ typedef struct flux_transformer {
     float *double_mod_txt;          /* [hidden * 6] */
     float *double_img_attn_out;     /* [max_seq, hidden] */
     float *double_txt_attn_out;     /* [max_seq, hidden] */
+
+    /* Mmap mode: keep safetensors file open, load block weights on-demand */
+    int use_mmap;
+    safetensors_file_t *sf;
 } flux_transformer_t;
 
 /* Forward declarations */
 void flux_transformer_free(flux_transformer_t *tf);
+static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
+static void free_double_block_weights(double_block_t *b);
+static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
+static void free_single_block_weights(single_block_t *b);
+
+/* ========================================================================
+ * Mmap mode: on-demand weight loading/freeing for blocks
+ * ======================================================================== */
+
+/* Helper to get tensor as f32 (used by mmap load functions) */
+static float *mmap_get_f32(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) {
+        fprintf(stderr, "Error: required tensor %s not found\n", name);
+        return NULL;
+    }
+    return safetensors_get_f32(sf, t);
+}
+
+/* Helper to get tensor as bf16 (used by mmap load functions) */
+static uint16_t *mmap_get_bf16(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) return NULL;
+    if (!safetensor_is_bf16(t)) return NULL;
+    return safetensors_get_bf16(sf, t);
+}
+
+/* Load weights for a single double_block on-demand */
+static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
+                                     int idx, int h, int mlp, int use_bf16) {
+    char name[256];
+
+    /* Image attention - QK norm weights (always f32) */
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_q.weight", idx);
+    b->img_norm_q_weight = mmap_get_f32(sf, name);
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", idx);
+    b->img_norm_k_weight = mmap_get_f32(sf, name);
+
+    /* Image Q, K, V projections */
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_q.weight", idx);
+    b->img_q_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_q_weight_bf16 = mmap_get_bf16(sf, name);
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_k.weight", idx);
+    b->img_k_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_k_weight_bf16 = mmap_get_bf16(sf, name);
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_v.weight", idx);
+    b->img_v_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_v_weight_bf16 = mmap_get_bf16(sf, name);
+
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_out.0.weight", idx);
+    b->img_proj_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_proj_weight_bf16 = mmap_get_bf16(sf, name);
+
+    /* Image FFN - linear_in contains gate and up fused */
+    snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_in.weight", idx);
+    float *ff_in = mmap_get_f32(sf, name);
+    if (ff_in) {
+        b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
+        b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
+        memcpy(b->img_mlp_gate_weight, ff_in, mlp * h * sizeof(float));
+        memcpy(b->img_mlp_up_weight, ff_in + mlp * h, mlp * h * sizeof(float));
+        free(ff_in);
+    }
+    if (use_bf16) {
+        uint16_t *ff_in_bf16 = mmap_get_bf16(sf, name);
+        if (ff_in_bf16) {
+            b->img_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
+            b->img_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
+            memcpy(b->img_mlp_gate_weight_bf16, ff_in_bf16, mlp * h * sizeof(uint16_t));
+            memcpy(b->img_mlp_up_weight_bf16, ff_in_bf16 + mlp * h, mlp * h * sizeof(uint16_t));
+            free(ff_in_bf16);
+        }
+    }
+
+    snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_out.weight", idx);
+    b->img_mlp_down_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
+
+    /* Text stream - QK norm weights (always f32) */
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_q.weight", idx);
+    b->txt_norm_q_weight = mmap_get_f32(sf, name);
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_k.weight", idx);
+    b->txt_norm_k_weight = mmap_get_f32(sf, name);
+
+    /* Text Q, K, V projections */
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_q_proj.weight", idx);
+    b->txt_q_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_q_weight_bf16 = mmap_get_bf16(sf, name);
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_k_proj.weight", idx);
+    b->txt_k_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_k_weight_bf16 = mmap_get_bf16(sf, name);
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_v_proj.weight", idx);
+    b->txt_v_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_v_weight_bf16 = mmap_get_bf16(sf, name);
+
+    snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_add_out.weight", idx);
+    b->txt_proj_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_proj_weight_bf16 = mmap_get_bf16(sf, name);
+
+    /* Text FFN */
+    snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_in.weight", idx);
+    float *txt_ff_in = mmap_get_f32(sf, name);
+    if (txt_ff_in) {
+        b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
+        b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
+        memcpy(b->txt_mlp_gate_weight, txt_ff_in, mlp * h * sizeof(float));
+        memcpy(b->txt_mlp_up_weight, txt_ff_in + mlp * h, mlp * h * sizeof(float));
+        free(txt_ff_in);
+    }
+    if (use_bf16) {
+        uint16_t *txt_ff_in_bf16 = mmap_get_bf16(sf, name);
+        if (txt_ff_in_bf16) {
+            b->txt_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
+            b->txt_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
+            memcpy(b->txt_mlp_gate_weight_bf16, txt_ff_in_bf16, mlp * h * sizeof(uint16_t));
+            memcpy(b->txt_mlp_up_weight_bf16, txt_ff_in_bf16 + mlp * h, mlp * h * sizeof(uint16_t));
+            free(txt_ff_in_bf16);
+        }
+    }
+
+    snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_out.weight", idx);
+    b->txt_mlp_down_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
+
+    return 0;
+}
+
+/* Free weights for a single double_block */
+static void free_double_block_weights(double_block_t *b) {
+    free(b->img_norm_q_weight); b->img_norm_q_weight = NULL;
+    free(b->img_norm_k_weight); b->img_norm_k_weight = NULL;
+    free(b->img_q_weight); b->img_q_weight = NULL;
+    free(b->img_k_weight); b->img_k_weight = NULL;
+    free(b->img_v_weight); b->img_v_weight = NULL;
+    free(b->img_proj_weight); b->img_proj_weight = NULL;
+    free(b->img_mlp_gate_weight); b->img_mlp_gate_weight = NULL;
+    free(b->img_mlp_up_weight); b->img_mlp_up_weight = NULL;
+    free(b->img_mlp_down_weight); b->img_mlp_down_weight = NULL;
+    free(b->img_q_weight_bf16); b->img_q_weight_bf16 = NULL;
+    free(b->img_k_weight_bf16); b->img_k_weight_bf16 = NULL;
+    free(b->img_v_weight_bf16); b->img_v_weight_bf16 = NULL;
+    free(b->img_proj_weight_bf16); b->img_proj_weight_bf16 = NULL;
+    free(b->img_mlp_gate_weight_bf16); b->img_mlp_gate_weight_bf16 = NULL;
+    free(b->img_mlp_up_weight_bf16); b->img_mlp_up_weight_bf16 = NULL;
+    free(b->img_mlp_down_weight_bf16); b->img_mlp_down_weight_bf16 = NULL;
+    free(b->txt_norm_q_weight); b->txt_norm_q_weight = NULL;
+    free(b->txt_norm_k_weight); b->txt_norm_k_weight = NULL;
+    free(b->txt_q_weight); b->txt_q_weight = NULL;
+    free(b->txt_k_weight); b->txt_k_weight = NULL;
+    free(b->txt_v_weight); b->txt_v_weight = NULL;
+    free(b->txt_proj_weight); b->txt_proj_weight = NULL;
+    free(b->txt_mlp_gate_weight); b->txt_mlp_gate_weight = NULL;
+    free(b->txt_mlp_up_weight); b->txt_mlp_up_weight = NULL;
+    free(b->txt_mlp_down_weight); b->txt_mlp_down_weight = NULL;
+    free(b->txt_q_weight_bf16); b->txt_q_weight_bf16 = NULL;
+    free(b->txt_k_weight_bf16); b->txt_k_weight_bf16 = NULL;
+    free(b->txt_v_weight_bf16); b->txt_v_weight_bf16 = NULL;
+    free(b->txt_proj_weight_bf16); b->txt_proj_weight_bf16 = NULL;
+    free(b->txt_mlp_gate_weight_bf16); b->txt_mlp_gate_weight_bf16 = NULL;
+    free(b->txt_mlp_up_weight_bf16); b->txt_mlp_up_weight_bf16 = NULL;
+    free(b->txt_mlp_down_weight_bf16); b->txt_mlp_down_weight_bf16 = NULL;
+}
+
+/* Load weights for a single single_block on-demand */
+static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf,
+                                     int idx, int h, int mlp, int use_bf16) {
+    char name[256];
+    (void)h; (void)mlp;  /* Unused in single block */
+
+    /* QK norm weights (always f32, small) */
+    snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_q.weight", idx);
+    b->norm_q_weight = mmap_get_f32(sf, name);
+    snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_k.weight", idx);
+    b->norm_k_weight = mmap_get_f32(sf, name);
+
+    /* Fused QKV+MLP input projection */
+    snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj.weight", idx);
+    b->qkv_mlp_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->qkv_mlp_weight_bf16 = mmap_get_bf16(sf, name);
+
+    /* Fused attn out + MLP down projection */
+    snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_out.weight", idx);
+    b->proj_mlp_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->proj_mlp_weight_bf16 = mmap_get_bf16(sf, name);
+
+    return 0;
+}
+
+/* Free weights for a single single_block */
+static void free_single_block_weights(single_block_t *b) {
+    free(b->norm_q_weight); b->norm_q_weight = NULL;
+    free(b->norm_k_weight); b->norm_k_weight = NULL;
+    free(b->qkv_mlp_weight); b->qkv_mlp_weight = NULL;
+    free(b->proj_mlp_weight); b->proj_mlp_weight = NULL;
+    free(b->qkv_mlp_weight_bf16); b->qkv_mlp_weight_bf16 = NULL;
+    free(b->proj_mlp_weight_bf16); b->proj_mlp_weight_bf16 = NULL;
+}
 
 /* ========================================================================
  * RoPE (Rotary Position Embeddings)
@@ -598,6 +801,111 @@ static void transpose_hsd_to_shd(float *out, const float *in,
     }
 }
 #endif /* USE_METAL || USE_BLAS */
+
+/* Ensure attn_scores buffer is large enough for current sequence lengths.
+ * Only needed for BLAS/Metal paths - flash attention doesn't use this buffer.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int ensure_attn_scores(flux_transformer_t *tf, int img_seq, int txt_seq) {
+#if defined(USE_METAL) || defined(USE_BLAS)
+    int total_seq = img_seq + txt_seq;
+    /* Need space for num_heads * max_seq * max_seq where max_seq = total_seq
+     * This covers both self-attention and joint attention needs */
+    size_t needed = (size_t)tf->num_heads * total_seq * total_seq * sizeof(float);
+
+    if (tf->attn_scores_alloc < needed) {
+        free(tf->attn_scores);
+        tf->attn_scores = (float *)malloc(needed);
+        if (!tf->attn_scores) {
+            tf->attn_scores_alloc = 0;
+            return -1;
+        }
+        tf->attn_scores_alloc = needed;
+    }
+    return 0;
+#else
+    (void)tf; (void)img_seq; (void)txt_seq;
+    return 0;  /* Flash attention doesn't need attn_scores */
+#endif
+}
+
+/* Ensure all work buffers are allocated for the given sequence length.
+ * Buffers are only reallocated if the current allocation is too small.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int ensure_work_buffers(flux_transformer_t *tf, int total_seq) {
+    if (tf->work_seq_alloc >= total_seq) {
+        return 0;  /* Already have enough space */
+    }
+
+    int hidden = tf->hidden_size;
+    int mlp = tf->mlp_hidden;
+
+    /* Free old buffers */
+    free(tf->img_hidden);
+    free(tf->txt_hidden);
+    free(tf->work1);
+    free(tf->work2);
+    free(tf->attn_q_t);
+    free(tf->attn_k_t);
+    free(tf->attn_v_t);
+    free(tf->attn_out_t);
+    free(tf->attn_cat_k);
+    free(tf->attn_cat_v);
+    free(tf->single_q);
+    free(tf->single_k);
+    free(tf->single_v);
+    free(tf->single_mlp_gate);
+    free(tf->single_mlp_up);
+    free(tf->single_attn_out);
+    free(tf->single_concat);
+    free(tf->ffn_gate);
+    free(tf->ffn_up);
+    free(tf->double_img_attn_out);
+    free(tf->double_txt_attn_out);
+
+    /* Allocate new buffers */
+    tf->img_hidden = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->txt_hidden = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    /* work2 needs to hold fused QKV+MLP output: seq * (hidden*3 + mlp*2) + mod_params (hidden*3)
+     * fused_dim = hidden*3 + mlp*2 = 3072*3 + 9216*2 = 27648 */
+    int fused_dim = hidden * 3 + mlp * 2;
+    tf->work_size = (size_t)total_seq * fused_dim * sizeof(float) + (size_t)hidden * 3 * sizeof(float);
+    tf->work1 = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->work2 = (float *)malloc(tf->work_size);
+    tf->attn_q_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->attn_k_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->attn_v_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->attn_out_t = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->attn_cat_k = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->attn_cat_v = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->single_q = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->single_k = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->single_v = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->single_mlp_gate = (float *)malloc((size_t)total_seq * mlp * sizeof(float));
+    tf->single_mlp_up = (float *)malloc((size_t)total_seq * mlp * sizeof(float));
+    tf->single_attn_out = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->single_concat = (float *)malloc((size_t)total_seq * (hidden + mlp) * sizeof(float));
+    tf->ffn_gate = (float *)malloc((size_t)total_seq * mlp * sizeof(float));
+    tf->ffn_up = (float *)malloc((size_t)total_seq * mlp * sizeof(float));
+    tf->double_img_attn_out = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+    tf->double_txt_attn_out = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+
+    /* Check all allocations succeeded */
+    if (!tf->img_hidden || !tf->txt_hidden || !tf->work1 || !tf->work2 ||
+        !tf->attn_q_t || !tf->attn_k_t || !tf->attn_v_t || !tf->attn_out_t ||
+        !tf->attn_cat_k || !tf->attn_cat_v ||
+        !tf->single_q || !tf->single_k || !tf->single_v ||
+        !tf->single_mlp_gate || !tf->single_mlp_up || !tf->single_attn_out ||
+        !tf->single_concat || !tf->ffn_gate || !tf->ffn_up ||
+        !tf->double_img_attn_out || !tf->double_txt_attn_out) {
+        tf->work_seq_alloc = 0;
+        return -1;
+    }
+
+    tf->work_seq_alloc = total_seq;
+    return 0;
+}
 
 /* Multi-head attention with BLAS optimization
  * Uses pre-allocated workspace buffers from transformer struct
@@ -1285,6 +1593,7 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     int heads = tf->num_heads;
     int head_dim = tf->head_dim;
     int mlp_hidden = tf->mlp_hidden;
+    int fused_dim = h_size * 3 + mlp_hidden * 2;  /* QKV + gate + up */
     int img_seq = seq - img_offset;  /* Number of image tokens */
     float eps = 1e-6f;
 
@@ -1301,8 +1610,9 @@ static void single_block_forward(float *hidden, const single_block_t *block,
         t_emb_silu[i] = x / (1.0f + expf(-x));
     }
 
-    /* Use end of work2 for mod_params (3*hidden = 9216 floats, work2 has max_seq*hidden*4) */
-    float *mod_params = tf->work2 + tf->max_seq_len * h_size * 3;
+    /* Use end of work2 for mod_params (3*hidden = 9216 floats)
+     * fused_out uses seq * fused_dim floats, place mod_params after */
+    float *mod_params = tf->work2 + seq * fused_dim;
     flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
 
     float *shift = mod_params;
@@ -1317,7 +1627,6 @@ static void single_block_forward(float *hidden, const single_block_t *block,
      * Output: [seq, fused_dim] where fused_dim = [Q, K, V, gate, up]
      * Layout per position: [3072 Q, 3072 K, 3072 V, 9216 gate, 9216 up] = 27648 total
      */
-    int fused_dim = h_size * 3 + mlp_hidden * 2;
     float *fused_out = tf->work2;
     LINEAR_BF16_OR_F32(fused_out, norm, block->qkv_mlp_weight, block->qkv_mlp_weight_bf16,
                        seq, h_size, fused_dim);
@@ -1404,6 +1713,17 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     int head_dim = tf->head_dim;
     int axis_dim = 32;  /* FLUX uses axes_dims_rope: [32, 32, 32, 32] */
 
+    /* Ensure work buffers are sized for actual sequence length */
+    int total_seq = img_seq + txt_seq;
+    if (ensure_work_buffers(tf, total_seq) < 0) {
+        fprintf(stderr, "Failed to allocate work buffers for seq_len=%d\n", total_seq);
+        return NULL;
+    }
+    if (ensure_attn_scores(tf, img_seq, txt_seq) < 0) {
+        fprintf(stderr, "Failed to allocate attention scores buffer\n");
+        return NULL;
+    }
+
     /* Get timestep embedding
      * FLUX.2-klein uses 256-dim sinusoidal (128 frequencies), not hidden_size
      * Use t_emb_silu as work buffer (it's not used until double blocks)
@@ -1478,6 +1798,11 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     /* Double-stream blocks */
     double double_start = tf_get_time_ms();
     for (int i = 0; i < tf->num_double_layers; i++) {
+        /* In mmap mode, load block weights on-demand */
+        if (tf->use_mmap) {
+            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+        }
         double_block_forward(img_hidden, txt_hidden,
                              &tf->double_blocks[i],
                              t_emb,
@@ -1486,6 +1811,10 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                              img_rope_cos, img_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              img_seq, txt_seq, tf);
+        /* In mmap mode, free block weights after use */
+        if (tf->use_mmap) {
+            free_double_block_weights(&tf->double_blocks[i]);
+        }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
 #ifdef DEBUG_TRANSFORMER
@@ -1511,7 +1840,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     /* Concatenate text and image for single-stream blocks
      * Python uses [txt, img] order for concatenation
      */
-    int total_seq = img_seq + txt_seq;
     float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, img_hidden,
@@ -1520,6 +1848,11 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     /* Single-stream blocks */
     double single_start = tf_get_time_ms();
     for (int i = 0; i < tf->num_single_layers; i++) {
+        /* In mmap mode, load block weights on-demand */
+        if (tf->use_mmap) {
+            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+        }
 #ifdef USE_METAL
         /* Try GPU-optimized path first */
         if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
@@ -1535,6 +1868,10 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                  img_rope_cos, img_rope_sin,
                                  txt_rope_cos, txt_rope_sin,
                                  total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
+        }
+        /* In mmap mode, free block weights after use */
+        if (tf->use_mmap) {
+            free_single_block_weights(&tf->single_blocks[i]);
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
@@ -1717,24 +2054,43 @@ flux_transformer_t *flux_transformer_load(FILE *f) {
     tf->rope_freqs = (float *)malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
     compute_rope_freqs(tf->rope_freqs, tf->max_seq_len, tf->head_dim, tf->rope_theta);
 
-    /* Allocate working memory */
-    int max_seq = tf->max_seq_len;
+    /* Work buffers are dynamically allocated in forward() based on actual sequence
+     * length. This avoids 8.4GB pre-allocation that was causing OOM on 16GB systems. */
     int hidden = tf->hidden_size;
-    tf->img_hidden = (float *)malloc(max_seq * hidden * sizeof(float));
-    tf->txt_hidden = (float *)malloc(max_seq * hidden * sizeof(float));
-    tf->work_size = max_seq * hidden * 4 * sizeof(float);
-    tf->work1 = (float *)malloc(tf->work_size);
-    tf->work2 = (float *)malloc(tf->work_size);
+    tf->img_hidden = NULL;
+    tf->txt_hidden = NULL;
+    tf->work_size = 0;
+    tf->work1 = NULL;
+    tf->work2 = NULL;
+    tf->attn_q_t = NULL;
+    tf->attn_k_t = NULL;
+    tf->attn_v_t = NULL;
+    tf->attn_out_t = NULL;
+    tf->attn_scores = NULL;
+    tf->attn_scores_alloc = 0;
+    tf->work_seq_alloc = 0;
+    tf->attn_cat_k = NULL;
+    tf->attn_cat_v = NULL;
+    tf->single_q = NULL;
+    tf->single_k = NULL;
+    tf->single_v = NULL;
+    tf->single_mlp_gate = NULL;
+    tf->single_mlp_up = NULL;
+    tf->single_attn_out = NULL;
+    tf->single_concat = NULL;
+    tf->ffn_gate = NULL;
+    tf->ffn_up = NULL;
+    tf->double_img_attn_out = NULL;
+    tf->double_txt_attn_out = NULL;
 
-    /* Pre-allocated attention workspaces to avoid malloc in hot path */
-    tf->attn_q_t = (float *)malloc(max_seq * hidden * sizeof(float));
-    tf->attn_k_t = (float *)malloc(max_seq * hidden * sizeof(float));
-    tf->attn_v_t = (float *)malloc(max_seq * hidden * sizeof(float));
-    tf->attn_out_t = (float *)malloc(max_seq * hidden * sizeof(float));
-    /* For GPU batched attention, need space for all heads' scores simultaneously */
-    tf->attn_scores = (float *)malloc((size_t)tf->num_heads * max_seq * max_seq * sizeof(float));
-    tf->attn_cat_k = (float *)malloc(max_seq * hidden * sizeof(float));
-    tf->attn_cat_v = (float *)malloc(max_seq * hidden * sizeof(float));
+    /* Small constant-size buffers */
+    tf->t_emb_silu = (float *)malloc(hidden * sizeof(float));
+    tf->double_mod_img = (float *)malloc(hidden * 6 * sizeof(float));
+    tf->double_mod_txt = (float *)malloc(hidden * 6 * sizeof(float));
+
+    if (!tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt) {
+        goto error;
+    }
 
     return tf;
 
@@ -1826,6 +2182,12 @@ void flux_transformer_free(flux_transformer_t *tf) {
     free(tf->double_mod_txt);
     free(tf->double_img_attn_out);
     free(tf->double_txt_attn_out);
+
+    /* Close safetensors file if in mmap mode */
+    if (tf->use_mmap && tf->sf) {
+        safetensors_close(tf->sf);
+        tf->sf = NULL;
+    }
 
     free(tf);
 }
@@ -2062,53 +2424,162 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
         compute_rope_freqs(tf->rope_freqs, tf->max_seq_len, tf->head_dim, tf->rope_theta);
     }
 
-    /* Allocate working memory */
-    int max_seq = tf->max_seq_len;
+    /* Work buffers are dynamically allocated in forward() based on actual sequence
+     * length. This avoids the 8.4GB pre-allocation that was causing OOM on 16GB systems. */
     int hidden = tf->hidden_size;
-    tf->img_hidden = malloc(max_seq * hidden * sizeof(float));
-    tf->txt_hidden = malloc(max_seq * hidden * sizeof(float));
-    tf->work_size = max_seq * hidden * 4 * sizeof(float);
-    tf->work1 = malloc(tf->work_size);
-    tf->work2 = malloc(tf->work_size);
+    tf->img_hidden = NULL;
+    tf->txt_hidden = NULL;
+    tf->work_size = 0;
+    tf->work1 = NULL;
+    tf->work2 = NULL;
+    tf->attn_q_t = NULL;
+    tf->attn_k_t = NULL;
+    tf->attn_v_t = NULL;
+    tf->attn_out_t = NULL;
+    tf->attn_scores = NULL;
+    tf->attn_scores_alloc = 0;
+    tf->work_seq_alloc = 0;
+    tf->attn_cat_k = NULL;
+    tf->attn_cat_v = NULL;
+    tf->single_q = NULL;
+    tf->single_k = NULL;
+    tf->single_v = NULL;
+    tf->single_mlp_gate = NULL;
+    tf->single_mlp_up = NULL;
+    tf->single_attn_out = NULL;
+    tf->single_concat = NULL;
+    tf->ffn_gate = NULL;
+    tf->ffn_up = NULL;
+    tf->double_img_attn_out = NULL;
+    tf->double_txt_attn_out = NULL;
 
-    /* Pre-allocated attention workspaces to avoid malloc in hot path */
-    tf->attn_q_t = malloc(max_seq * hidden * sizeof(float));
-    tf->attn_k_t = malloc(max_seq * hidden * sizeof(float));
-    tf->attn_v_t = malloc(max_seq * hidden * sizeof(float));
-    tf->attn_out_t = malloc(max_seq * hidden * sizeof(float));
-    /* For GPU batched attention, need space for all heads' scores simultaneously */
-    tf->attn_scores = malloc((size_t)tf->num_heads * max_seq * max_seq * sizeof(float));
-    tf->attn_cat_k = malloc(max_seq * hidden * sizeof(float));
-    tf->attn_cat_v = malloc(max_seq * hidden * sizeof(float));
-
-    /* Single-block work buffers (pre-allocated to avoid malloc in hot path) */
-    tf->single_q = malloc(max_seq * hidden * sizeof(float));
-    tf->single_k = malloc(max_seq * hidden * sizeof(float));
-    tf->single_v = malloc(max_seq * hidden * sizeof(float));
-    tf->single_mlp_gate = malloc((size_t)max_seq * mlp * sizeof(float));
-    tf->single_mlp_up = malloc((size_t)max_seq * mlp * sizeof(float));
-    tf->single_attn_out = malloc(max_seq * hidden * sizeof(float));
-    tf->single_concat = malloc((size_t)max_seq * (hidden + mlp) * sizeof(float));
-
-    /* FFN work buffers (shared by double and single blocks) */
-    tf->ffn_gate = malloc((size_t)max_seq * mlp * sizeof(float));
-    tf->ffn_up = malloc((size_t)max_seq * mlp * sizeof(float));
-
-    /* Double-block work buffers */
+    /* Small constant-size buffers - always allocate */
     tf->t_emb_silu = malloc(hidden * sizeof(float));
     tf->double_mod_img = malloc(hidden * 6 * sizeof(float));
     tf->double_mod_txt = malloc(hidden * 6 * sizeof(float));
-    tf->double_img_attn_out = malloc(max_seq * hidden * sizeof(float));
-    tf->double_txt_attn_out = malloc(max_seq * hidden * sizeof(float));
 
-    if (!tf->img_hidden || !tf->txt_hidden || !tf->work1 || !tf->work2 ||
-        !tf->attn_q_t || !tf->attn_k_t || !tf->attn_v_t || !tf->attn_out_t ||
-        !tf->attn_scores || !tf->attn_cat_k || !tf->attn_cat_v ||
-        !tf->single_q || !tf->single_k || !tf->single_v ||
-        !tf->single_mlp_gate || !tf->single_mlp_up || !tf->single_attn_out ||
-        !tf->single_concat || !tf->ffn_gate || !tf->ffn_up ||
-        !tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt ||
-        !tf->double_img_attn_out || !tf->double_txt_attn_out) {
+    if (!tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt) {
+        flux_transformer_free(tf);
+        return NULL;
+    }
+
+    return tf;
+}
+
+/* Load transformer in mmap mode - only load small weights, keep sf open for block loading */
+flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf) {
+    flux_transformer_t *tf = calloc(1, sizeof(flux_transformer_t));
+    if (!tf) return NULL;
+
+    /* Set config based on FLUX.2-klein-4B */
+    tf->hidden_size = 3072;
+    tf->num_heads = 24;
+    tf->head_dim = 128;
+    tf->mlp_hidden = 9216;
+    tf->num_double_layers = 5;
+    tf->num_single_layers = 20;
+    tf->text_dim = 7680;
+    tf->latent_channels = 128;
+    tf->max_seq_len = 18000;
+    tf->rope_dim = 128;
+    tf->rope_theta = 2000.0f;
+
+    /* Enable mmap mode - keep sf open, don't load block weights yet */
+    tf->use_mmap = 1;
+    tf->sf = sf;
+
+    /* Enable bf16 mode if Metal GPU is available */
+#ifdef USE_METAL
+    tf->use_bf16 = flux_metal_available();
+    if (tf->use_bf16) {
+        printf("Using bf16 weights for GPU acceleration (mmap mode)\n");
+    }
+#else
+    tf->use_bf16 = 0;
+#endif
+
+    /* Input projections - always load (small) */
+    tf->img_in_weight = get_sf_tensor_tf(sf, "x_embedder.weight");
+    tf->txt_in_weight = get_sf_tensor_tf(sf, "context_embedder.weight");
+    if (tf->use_bf16) {
+        tf->img_in_weight_bf16 = get_sf_tensor_bf16(sf, "x_embedder.weight");
+        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(sf, "context_embedder.weight");
+    }
+
+    /* Time embedding - always load (small) */
+    tf->time_embed.sincos_dim = 256;
+    tf->time_embed.fc1_weight = get_sf_tensor_tf(sf,
+        "time_guidance_embed.timestep_embedder.linear_1.weight");
+    tf->time_embed.fc2_weight = get_sf_tensor_tf(sf,
+        "time_guidance_embed.timestep_embedder.linear_2.weight");
+
+    /* Modulation weights - always load */
+    tf->adaln_double_img_weight = get_sf_tensor_tf(sf,
+        "double_stream_modulation_img.linear.weight");
+    tf->adaln_double_txt_weight = get_sf_tensor_tf(sf,
+        "double_stream_modulation_txt.linear.weight");
+    tf->adaln_single_weight = get_sf_tensor_tf(sf,
+        "single_stream_modulation.linear.weight");
+    if (tf->use_bf16) {
+        tf->adaln_double_img_weight_bf16 = get_sf_tensor_bf16(sf,
+            "double_stream_modulation_img.linear.weight");
+        tf->adaln_double_txt_weight_bf16 = get_sf_tensor_bf16(sf,
+            "double_stream_modulation_txt.linear.weight");
+        tf->adaln_single_weight_bf16 = get_sf_tensor_bf16(sf,
+            "single_stream_modulation.linear.weight");
+    }
+
+    /* Allocate empty block arrays - weights loaded on-demand */
+    tf->double_blocks = calloc(tf->num_double_layers, sizeof(double_block_t));
+    tf->single_blocks = calloc(tf->num_single_layers, sizeof(single_block_t));
+
+    /* Final layer - always load (small) */
+    tf->final_norm_weight = get_sf_tensor_tf(sf, "norm_out.linear.weight");
+    tf->final_proj_weight = get_sf_tensor_tf(sf, "proj_out.weight");
+    if (tf->use_bf16) {
+        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(sf, "proj_out.weight");
+    }
+
+    /* Precompute RoPE frequencies */
+    tf->rope_freqs = malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
+    if (tf->rope_freqs) {
+        compute_rope_freqs(tf->rope_freqs, tf->max_seq_len, tf->head_dim, tf->rope_theta);
+    }
+
+    /* Work buffers - dynamically allocated in forward() */
+    int hidden = tf->hidden_size;
+    tf->img_hidden = NULL;
+    tf->txt_hidden = NULL;
+    tf->work_size = 0;
+    tf->work1 = NULL;
+    tf->work2 = NULL;
+    tf->attn_q_t = NULL;
+    tf->attn_k_t = NULL;
+    tf->attn_v_t = NULL;
+    tf->attn_out_t = NULL;
+    tf->attn_scores = NULL;
+    tf->attn_scores_alloc = 0;
+    tf->work_seq_alloc = 0;
+    tf->attn_cat_k = NULL;
+    tf->attn_cat_v = NULL;
+    tf->single_q = NULL;
+    tf->single_k = NULL;
+    tf->single_v = NULL;
+    tf->single_mlp_gate = NULL;
+    tf->single_mlp_up = NULL;
+    tf->single_attn_out = NULL;
+    tf->single_concat = NULL;
+    tf->ffn_gate = NULL;
+    tf->ffn_up = NULL;
+    tf->double_img_attn_out = NULL;
+    tf->double_txt_attn_out = NULL;
+
+    /* Small constant-size buffers - always allocate */
+    tf->t_emb_silu = malloc(hidden * sizeof(float));
+    tf->double_mod_img = malloc(hidden * 6 * sizeof(float));
+    tf->double_mod_txt = malloc(hidden * 6 * sizeof(float));
+
+    if (!tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt) {
         flux_transformer_free(tf);
         return NULL;
     }

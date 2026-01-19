@@ -215,6 +215,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -v, --verbose         Detailed output\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
+    fprintf(stderr, "  -m, --mmap            Use mmap for text encoder (saves ~8GB RAM, slower)\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
@@ -252,6 +253,7 @@ int main(int argc, char *argv[]) {
         {"verbose",    no_argument,       0, 'v'},
         {"help",       no_argument,       0, 'h'},
         {"version",    no_argument,       0, 'V'},
+        {"mmap",       no_argument,       0, 'm'},
         {0, 0, 0, 0}
     };
 
@@ -273,9 +275,10 @@ int main(int argc, char *argv[]) {
     };
 
     int width_set = 0, height_set = 0;
+    int use_mmap = 0;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhV",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVm",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
@@ -296,6 +299,7 @@ int main(int argc, char *argv[]) {
             case 'V':
                 fprintf(stderr, "FLUX.2 klein 4B v1.0.0\n");
                 return 0;
+            case 'm': use_mmap = 1; break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -370,6 +374,12 @@ int main(int argc, char *argv[]) {
     if (!ctx) {
         fprintf(stderr, "\nError: Failed to load model: %s\n", flux_get_error());
         return 1;
+    }
+
+    /* Enable mmap mode if requested (reduces memory, slower inference) */
+    if (use_mmap) {
+        flux_set_mmap(ctx, 1);
+        LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");
     }
 
     double load_time = timer_end();

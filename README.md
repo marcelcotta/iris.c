@@ -42,6 +42,7 @@ That's it. No Python runtime, no PyTorch, no CUDA toolkit required at inference 
 - **Image-to-image**: Transform existing images guided by prompts
 - **Integrated text encoder**: Qwen3-4B encoder built-in, no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (~8GB freed)
+- **Low memory mode**: `--mmap` flag enables on-demand weight loading, reducing peak memory from ~16GB to ~4-5GB for 16GB RAM systems
 
 ## Usage
 
@@ -95,6 +96,7 @@ The `-t` (strength) parameter controls how much the image changes:
 
 **Other options:**
 ```
+-m, --mmap            Low memory mode (load weights on-demand, slower)
 -e, --embeddings PATH Load pre-computed text embeddings (advanced)
 -h, --help            Show help
 ```
@@ -184,6 +186,28 @@ This downloads approximately 16GB to `./flux-klein-model`:
 | Peak | ~16GB (if encoder not released) |
 
 The text encoder is automatically released after encoding, reducing peak memory during diffusion. If you generate multiple images with different prompts, the encoder reloads automatically.
+
+### Low Memory Inference
+
+For systems with limited RAM (16GB or less), the `--mmap` flag enables memory-mapped weight loading:
+
+```bash
+./flux -d flux-klein-model -p "A cat" -o cat.png --mmap
+```
+
+**How it works:** Instead of loading all model weights into RAM upfront, `--mmap` keeps the safetensors files memory-mapped and loads weights on-demand:
+
+- **Text encoder (Qwen3):** Each of the 36 transformer layers (~400MB each) is loaded, processed, and immediately freed. Only ~2GB stays resident instead of ~8GB.
+- **Denoising transformer:** Each of the 5 double-blocks (~300MB) and 20 single-blocks (~150MB) is loaded on-demand and freed after use. Only ~200MB of shared weights stays resident instead of ~4GB.
+
+This reduces peak memory from ~16GB to ~4-5GB, making inference possible on systems with only 16GB of RAM (tested on Linux).
+
+**Backend compatibility:**
+- `make generic` - Works
+- `make blas` - Works
+- `make mps` - Works, but less beneficial since MPS already uses bf16 weights on GPU (no expansion to float32), so memory pressure is lower
+
+**Trade-off:** Inference is slower with `--mmap` due to repeated disk I/O and weight conversion. Use it only when you don't have enough RAM for normal operation.
 
 ### How Fast Is It?
 

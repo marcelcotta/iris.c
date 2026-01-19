@@ -113,6 +113,14 @@ void flux_free(flux_ctx *ctx);
 void flux_release_text_encoder(flux_ctx *ctx);
 
 /*
+ * Enable mmap mode for text encoder (--mmap).
+ * Uses memory-mapped bf16 weights directly instead of converting to f32.
+ * Reduces memory usage from ~16GB to ~8GB but is slower due to on-the-fly conversion.
+ * Call this after flux_load_dir() and before first generation.
+ */
+void flux_set_mmap(flux_ctx *ctx, int enable);
+
+/*
  * Text-to-image generation.
  * Returns newly allocated image, caller must free with flux_image_free().
  * Returns NULL on error.

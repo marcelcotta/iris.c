@@ -125,8 +125,9 @@ typedef struct qwen3_encoder {
 /*
  * Load complete text encoder (tokenizer + model).
  * model_dir should contain both tokenizer/ and text_encoder/ subdirectories.
+ * use_mmap: if true, use memory-mapped bf16 weights (saves ~8GB, slower inference)
  */
-qwen3_encoder_t *qwen3_encoder_load(const char *model_dir);
+qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap);
 
 /*
  * Free encoder resources.

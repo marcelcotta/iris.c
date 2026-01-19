@@ -97,7 +97,16 @@ struct qwen3_model {
     float *attn_k_head_t;     /* [head_dim, seq_len] */
     float *attn_v_head;       /* [seq_len, head_dim] */
     float *attn_out_head;     /* [seq_len, head_dim] */
+
+    /* Mmap mode: keep safetensors files open, load layer weights on-demand */
+    int use_mmap;
+    safetensors_file_t *sf_files[2];
 };
+
+/* Forward declarations for mmap streaming mode */
+static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
+                              int num_files, int layer_idx);
+static void free_layer_weights(qwen3_layer_t *layer);
 
 /* ========================================================================
  * Basic Operations
@@ -504,7 +513,21 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 
     /* Run through transformer layers */
     for (int layer_idx = 0; layer_idx < model->num_layers; layer_idx++) {
+        /* In mmap mode, load layer weights on-demand */
+        if (model->use_mmap) {
+            safetensors_file_t *files[2] = {model->sf_files[0], model->sf_files[1]};
+            if (load_layer_weights(&model->layers[layer_idx], files, 2, layer_idx) != 0) {
+                fprintf(stderr, "Failed to load layer %d weights\n", layer_idx);
+                return NULL;
+            }
+        }
+
         qwen3_layer_forward(model, &model->layers[layer_idx], seq_len, attention_mask);
+
+        /* In mmap mode, free layer weights after use */
+        if (model->use_mmap) {
+            free_layer_weights(&model->layers[layer_idx]);
+        }
 
         /* Save output at extraction layers (9, 18, 27) */
         if (layer_idx == QWEN3_OUTPUT_LAYER_1) {
@@ -615,6 +638,22 @@ static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
     return 0;
 }
 
+/* Free a single layer's weights (used in mmap streaming mode) */
+static void free_layer_weights(qwen3_layer_t *layer) {
+    free(layer->input_layernorm_weight);
+    free(layer->post_attention_layernorm_weight);
+    free(layer->attn.q_proj_weight);
+    free(layer->attn.k_proj_weight);
+    free(layer->attn.v_proj_weight);
+    free(layer->attn.o_proj_weight);
+    free(layer->attn.q_norm_weight);
+    free(layer->attn.k_norm_weight);
+    free(layer->mlp.gate_proj_weight);
+    free(layer->mlp.up_proj_weight);
+    free(layer->mlp.down_proj_weight);
+    memset(layer, 0, sizeof(*layer));
+}
+
 qwen3_model_t *qwen3_model_load(const char *model_dir) {
     qwen3_model_t *model = calloc(1, sizeof(qwen3_model_t));
     if (!model) return NULL;
@@ -716,6 +755,95 @@ error:
     return NULL;
 }
 
+/* Load model in mmap mode - keeps safetensors files open and loads layer weights
+ * on-demand during forward pass. Reduces peak memory from ~16GB to ~2GB. */
+qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
+    qwen3_model_t *model = calloc(1, sizeof(qwen3_model_t));
+    if (!model) return NULL;
+
+    model->use_mmap = 1;
+    model->num_layers = QWEN3_NUM_LAYERS;
+    model->layers = calloc(model->num_layers, sizeof(qwen3_layer_t));
+    if (!model->layers) {
+        free(model);
+        return NULL;
+    }
+
+    /* Open safetensors files and keep them open */
+    char path1[512], path2[512];
+    snprintf(path1, sizeof(path1), "%s/model-00001-of-00002.safetensors", model_dir);
+    snprintf(path2, sizeof(path2), "%s/model-00002-of-00002.safetensors", model_dir);
+
+    model->sf_files[0] = safetensors_open(path1);
+    model->sf_files[1] = safetensors_open(path2);
+
+    if (!model->sf_files[0] || !model->sf_files[1]) {
+        fprintf(stderr, "qwen3_model_load_mmap: failed to open safetensors files\n");
+        goto error;
+    }
+
+    safetensors_file_t *files[2] = {model->sf_files[0], model->sf_files[1]};
+
+    /* Load only embeddings (1.56GB) - needed for all tokens */
+    model->embed_tokens = load_tensor(files, 2, "model.embed_tokens.weight");
+    if (!model->embed_tokens) {
+        fprintf(stderr, "qwen3_model_load_mmap: failed to load embed_tokens\n");
+        goto error;
+    }
+
+    /* Load final norm (small) */
+    model->norm_weight = load_tensor(files, 2, "model.norm.weight");
+    if (!model->norm_weight) {
+        fprintf(stderr, "qwen3_model_load_mmap: failed to load final norm\n");
+        goto error;
+    }
+
+    /* DON'T load layer weights - they'll be loaded on-demand in forward pass */
+    fprintf(stderr, "Mmap mode: layer weights will be loaded on-demand\n");
+
+    /* Compute RoPE frequencies */
+    int max_seq = QWEN3_MAX_SEQ_LEN;
+    int half_dim = QWEN3_HEAD_DIM / 2;
+    model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
+    model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
+    compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
+                       QWEN3_HEAD_DIM, QWEN3_ROPE_THETA);
+
+    /* Allocate working memory (same as normal mode) */
+    int seq_len = QWEN3_MAX_SEQ_LEN;
+    int hidden = QWEN3_HIDDEN_SIZE;
+    int num_heads = QWEN3_NUM_HEADS;
+    int num_kv_heads = QWEN3_NUM_KV_HEADS;
+    int head_dim = QWEN3_HEAD_DIM;
+    int intermediate = QWEN3_INTERMEDIATE_SIZE;
+
+    model->hidden_state = malloc(seq_len * hidden * sizeof(float));
+    model->residual = malloc(seq_len * hidden * sizeof(float));
+    model->q_buf = malloc(seq_len * num_heads * head_dim * sizeof(float));
+    model->k_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
+    model->v_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
+    model->attn_scores = malloc(num_heads * seq_len * seq_len * sizeof(float));
+    model->attn_out = malloc(seq_len * num_heads * head_dim * sizeof(float));
+    model->mlp_gate = malloc(seq_len * intermediate * sizeof(float));
+    model->mlp_up = malloc(seq_len * intermediate * sizeof(float));
+    model->mlp_out = malloc(seq_len * hidden * sizeof(float));
+    model->norm_buf = malloc(seq_len * hidden * sizeof(float));
+    model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_k_head_t = malloc(head_dim * seq_len * sizeof(float));
+    model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
+
+    for (int i = 0; i < 3; i++) {
+        model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
+    }
+
+    return model;
+
+error:
+    qwen3_model_free(model);
+    return NULL;
+}
+
 void qwen3_model_free(qwen3_model_t *model) {
     if (!model) return;
 
@@ -764,6 +892,10 @@ void qwen3_model_free(qwen3_model_t *model) {
         free(model->layer_outputs[i]);
     }
 
+    /* Close mmap'd safetensors files if open */
+    if (model->sf_files[0]) safetensors_close(model->sf_files[0]);
+    if (model->sf_files[1]) safetensors_close(model->sf_files[1]);
+
     free(model);
 }
 
@@ -771,7 +903,7 @@ void qwen3_model_free(qwen3_model_t *model) {
  * Combined Encoder API
  * ======================================================================== */
 
-qwen3_encoder_t *qwen3_encoder_load(const char *model_dir) {
+qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
     qwen3_encoder_t *enc = calloc(1, sizeof(qwen3_encoder_t));
     if (!enc) return NULL;
 
@@ -785,10 +917,14 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir) {
         return NULL;
     }
 
-    /* Load model */
+    /* Load model - use mmap mode if requested (saves ~14GB RAM) */
     char model_path[512];
     snprintf(model_path, sizeof(model_path), "%s/text_encoder", model_dir);
-    enc->model = qwen3_model_load(model_path);
+    if (use_mmap) {
+        enc->model = qwen3_model_load_mmap(model_path);
+    } else {
+        enc->model = qwen3_model_load(model_path);
+    }
     if (!enc->model) {
         fprintf(stderr, "qwen3_encoder_load: failed to load model\n");
         qwen3_tokenizer_free(enc->tokenizer);

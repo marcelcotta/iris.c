@@ -40,6 +40,7 @@ extern float *flux_image_to_tensor(const flux_image *img);
 
 extern flux_transformer_t *flux_transformer_load(FILE *f);
 extern flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf);
+extern flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf);
 extern void flux_transformer_free(flux_transformer_t *tf);
 extern float *flux_transformer_forward(flux_transformer_t *tf,
                                         const float *img_latent, int img_h, int img_w,
@@ -83,6 +84,9 @@ struct flux_ctx {
     char model_name[64];
     char model_version[32];
     char model_dir[512];  /* For reloading text encoder if released */
+
+    /* Memory mode */
+    int use_mmap;  /* Use mmap for text encoder (lower memory, slower) */
 };
 
 /* Global error message */
@@ -170,6 +174,10 @@ void flux_free(flux_ctx *ctx) {
     free(ctx);
 }
 
+void flux_set_mmap(flux_ctx *ctx, int enable) {
+    if (ctx) ctx->use_mmap = enable;
+}
+
 void flux_release_text_encoder(flux_ctx *ctx) {
     if (!ctx || !ctx->qwen3_encoder) return;
 
@@ -188,8 +196,14 @@ static int flux_load_transformer_if_needed(flux_ctx *ctx) {
     if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 0);
     safetensors_file_t *sf = safetensors_open(path);
     if (sf) {
-        ctx->transformer = flux_transformer_load_safetensors(sf);
-        safetensors_close(sf);
+        if (ctx->use_mmap) {
+            /* Mmap mode: load only small weights, keep sf open for on-demand loading.
+             * The transformer takes ownership of sf and will close it on free. */
+            ctx->transformer = flux_transformer_load_safetensors_mmap(sf);
+        } else {
+            ctx->transformer = flux_transformer_load_safetensors(sf);
+            safetensors_close(sf);
+        }
     }
     if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 1);
 
@@ -218,7 +232,7 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
     /* Load encoder if not already loaded */
     if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
         if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 0);
-        ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir);
+        ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir, ctx->use_mmap);
         if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 1);
         if (!ctx->qwen3_encoder) {
             fprintf(stderr, "Warning: Failed to load Qwen3 text encoder\n");
