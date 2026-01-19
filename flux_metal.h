@@ -127,6 +127,18 @@ flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements)
 flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements);
 
 /*
+ * Create a persistent GPU tensor that won't be released back to the pool.
+ * Use this for tensors that need to stay on GPU between operations.
+ * Call flux_gpu_tensor_free() when completely done with the tensor.
+ */
+flux_gpu_tensor_t flux_gpu_tensor_alloc_persistent(size_t num_elements);
+
+/*
+ * Mark an existing tensor as persistent (won't return to pool on free).
+ */
+void flux_gpu_tensor_set_persistent(flux_gpu_tensor_t tensor, int persistent);
+
+/*
  * Copy tensor data back to CPU.
  * Waits for any pending GPU operations on this tensor.
  */
@@ -184,6 +196,30 @@ void flux_gpu_batch_begin(void);
  */
 void flux_gpu_batch_end(void);
 
+/* ========================================================================
+ * GPU Operation Chains - Keep data on GPU between operations
+ * ======================================================================== */
+
+/*
+ * Begin an operation chain. Operations within a chain:
+ * - Share the same command buffer (reduced dispatch overhead)
+ * - Keep intermediate results on GPU (no CPU round-trips)
+ * - Only sync at chain end
+ * Must be ended with flux_gpu_chain_end().
+ */
+void flux_gpu_chain_begin(void);
+
+/*
+ * End an operation chain and execute all queued operations.
+ * Results stay in GPU tensors until explicitly read.
+ */
+void flux_gpu_chain_end(void);
+
+/*
+ * Check if currently in chain mode.
+ */
+int flux_gpu_in_chain(void);
+
 /*
  * GPU-accelerated scaled dot-product attention.
  * Computes attention for all heads in a single GPU batch.
@@ -200,6 +236,27 @@ void flux_metal_attention(float *out,
                           float *scores_scratch,
                           int heads, int seq_q, int seq_k, int head_dim,
                           float scale);
+
+/*
+ * GPU-accelerated causal attention for text encoder (Qwen3).
+ * Processes all heads in parallel on GPU with causal masking.
+ * Supports GQA (Grouped Query Attention) where Q heads > KV heads.
+ *
+ * Q: [seq, num_q_heads * head_dim] - query tensor
+ * K: [seq, num_kv_heads * head_dim] - key tensor (may have fewer heads)
+ * V: [seq, num_kv_heads * head_dim] - value tensor
+ * out: [seq, num_q_heads * head_dim] - output tensor
+ * attention_mask: [seq] - 1 for valid tokens, 0 for padding (can be NULL)
+ *
+ * This does: out = softmax(Q @ K^T * scale + causal_mask + attn_mask) @ V
+ * All operations are fused in a single GPU kernel.
+ * Returns 1 on success, 0 on failure (falls back to CPU).
+ */
+int flux_metal_causal_attention(float *out,
+                                 const float *Q, const float *K, const float *V,
+                                 const int *attention_mask,
+                                 int seq, int num_q_heads, int num_kv_heads,
+                                 int head_dim, float scale);
 
 /* ========================================================================
  * GPU Compute Shaders - Element-wise operations on GPU

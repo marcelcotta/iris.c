@@ -838,21 +838,26 @@ void flux_metal_attention(float *out,
         size_t sizeScores = heads * scores_stride * sizeof(float);
         size_t sizeOut = heads * out_stride * sizeof(float);
 
-        /* Create GPU buffers using shared memory (zero-copy on Apple Silicon) */
-        id<MTLBuffer> bufQ = [g_device newBufferWithBytes:Q length:sizeQ
-                                                  options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufK = [g_device newBufferWithBytes:K length:sizeK
-                                                  options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufV = [g_device newBufferWithBytes:V length:sizeV
-                                                  options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufScores = [g_device newBufferWithLength:sizeScores
-                                                        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufOut = [g_device newBufferWithLength:sizeOut
-                                                     options:MTLResourceStorageModeShared];
+        /* Use pooled buffers for efficiency (avoids allocation overhead) */
+        id<MTLBuffer> bufQ = pool_get_buffer(sizeQ);
+        id<MTLBuffer> bufK = pool_get_buffer(sizeK);
+        id<MTLBuffer> bufV = pool_get_buffer(sizeV);
+        id<MTLBuffer> bufScores = pool_get_buffer(sizeScores);
+        id<MTLBuffer> bufOut = pool_get_buffer(sizeOut);
 
         if (!bufQ || !bufK || !bufV || !bufScores || !bufOut) {
+            if (bufQ) pool_release_buffer(bufQ);
+            if (bufK) pool_release_buffer(bufK);
+            if (bufV) pool_release_buffer(bufV);
+            if (bufScores) pool_release_buffer(bufScores);
+            if (bufOut) pool_release_buffer(bufOut);
             return;
         }
+
+        /* Copy input data to GPU buffers */
+        memcpy([bufQ contents], Q, sizeQ);
+        memcpy([bufK contents], K, sizeK);
+        memcpy([bufV contents], V, sizeV);
 
         /* Check if GPU softmax is available */
         int use_gpu_softmax = g_shaders_initialized && g_softmax_pipeline;
@@ -992,6 +997,13 @@ void flux_metal_attention(float *out,
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
         memcpy(out, [bufOut contents], sizeOut);
+
+        /* Release pooled buffers */
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufV);
+        pool_release_buffer(bufScores);
+        pool_release_buffer(bufOut);
     }
 }
 
@@ -1004,11 +1016,16 @@ struct flux_gpu_tensor {
     id<MTLBuffer> buffer;
     size_t num_elements;
     int has_pending_work;  /* Flag to track if GPU work is pending */
+    int persistent;        /* If set, don't release to pool on free */
 };
 
 /* Pending command buffer for batched operations */
 static id<MTLCommandBuffer> g_tensor_cmd = nil;
 static int g_tensor_batch_mode = 0;
+
+/* Chain mode - keep data on GPU between operations */
+static id<MTLCommandBuffer> g_chain_cmd = nil;
+static int g_chain_mode = 0;
 
 flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements) {
     if (!g_initialized || !data || num_elements == 0) return NULL;
@@ -1033,6 +1050,7 @@ flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements)
         tensor->buffer = buf;
         tensor->num_elements = num_elements;
         tensor->has_pending_work = 0;
+        tensor->persistent = 0;
 
         return tensor;
     }
@@ -1058,8 +1076,41 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements) {
         tensor->buffer = buf;
         tensor->num_elements = num_elements;
         tensor->has_pending_work = 0;
+        tensor->persistent = 0;
 
         return tensor;
+    }
+}
+
+flux_gpu_tensor_t flux_gpu_tensor_alloc_persistent(size_t num_elements) {
+    if (!g_initialized || num_elements == 0) return NULL;
+
+    @autoreleasepool {
+        size_t size = num_elements * sizeof(float);
+
+        /* Allocate directly (not from pool) so it's not reclaimed */
+        id<MTLBuffer> buf = [g_device newBufferWithLength:size
+                                                  options:MTLResourceStorageModeShared];
+        if (!buf) return NULL;
+
+        /* Allocate tensor structure */
+        flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
+        if (!tensor) {
+            return NULL;
+        }
+
+        tensor->buffer = buf;
+        tensor->num_elements = num_elements;
+        tensor->has_pending_work = 0;
+        tensor->persistent = 1;  /* Mark as persistent */
+
+        return tensor;
+    }
+}
+
+void flux_gpu_tensor_set_persistent(flux_gpu_tensor_t tensor, int persistent) {
+    if (tensor) {
+        tensor->persistent = persistent;
     }
 }
 
@@ -1085,9 +1136,14 @@ float *flux_gpu_tensor_data(flux_gpu_tensor_t tensor) {
 void flux_gpu_tensor_free(flux_gpu_tensor_t tensor) {
     if (!tensor) return;
 
-    /* Release buffer back to pool */
-    pool_release_buffer(tensor->buffer);
-    tensor->buffer = nil;
+    if (tensor->persistent) {
+        /* Persistent tensors are not pooled - just release under ARC */
+        tensor->buffer = nil;
+    } else {
+        /* Release buffer back to pool */
+        pool_release_buffer(tensor->buffer);
+        tensor->buffer = nil;
+    }
 
     free(tensor);
 }
@@ -1131,8 +1187,50 @@ void flux_gpu_batch_end(void) {
     }
 }
 
+/* ========================================================================
+ * Operation Chain API - Keep data on GPU between operations
+ * ======================================================================== */
+
+void flux_gpu_chain_begin(void) {
+    if (!g_initialized || g_chain_mode) return;
+
+    @autoreleasepool {
+        g_chain_cmd = [g_queue commandBuffer];
+        g_chain_mode = 1;
+    }
+}
+
+void flux_gpu_chain_end(void) {
+    if (!g_initialized || !g_chain_mode) return;
+
+    @autoreleasepool {
+        if (g_chain_cmd) {
+            [g_chain_cmd commit];
+            [g_chain_cmd waitUntilCompleted];
+            g_chain_cmd = nil;
+        }
+        g_chain_mode = 0;
+    }
+}
+
+int flux_gpu_in_chain(void) {
+    return g_chain_mode;
+}
+
+/* Get command buffer for chain mode or create new one */
+static id<MTLCommandBuffer> get_chain_cmd(void) {
+    if (g_chain_mode && g_chain_cmd) {
+        return g_chain_cmd;
+    }
+    return [g_queue commandBuffer];
+}
+
 /* Get or create command buffer for tensor operations */
 static id<MTLCommandBuffer> get_tensor_cmd(void) {
+    /* Prefer chain mode command buffer if active */
+    if (g_chain_mode && g_chain_cmd) {
+        return g_chain_cmd;
+    }
     if (g_tensor_batch_mode && g_tensor_cmd) {
         return g_tensor_cmd;
     }
@@ -1244,6 +1342,7 @@ static id<MTLComputePipelineState> g_silu_pipeline = nil;
 static id<MTLComputePipelineState> g_silu_mul_pipeline = nil;
 static id<MTLComputePipelineState> g_softmax_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_2d_pipeline = nil;
+static id<MTLComputePipelineState> g_causal_attention_pipeline = nil;
 static int g_shaders_initialized = 0;
 
 int flux_metal_shaders_available(void) {
@@ -1374,6 +1473,15 @@ int flux_metal_init_shaders(void) {
             g_rope_2d_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_rope_2d_pipeline) {
                 fprintf(stderr, "Metal shaders: apply_rope_2d pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"causal_attention_fused"];
+        if (func) {
+            g_causal_attention_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_causal_attention_pipeline) {
+                fprintf(stderr, "Metal shaders: causal_attention_fused pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -1745,5 +1853,104 @@ void flux_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
         pool_release_buffer(bufX);
         pool_release_buffer(bufCos);
         pool_release_buffer(bufSin);
+    }
+}
+
+/* ========================================================================
+ * Causal Attention for Text Encoder (Qwen3)
+ * Fused GPU kernel that processes all heads in parallel with causal masking.
+ * ======================================================================== */
+
+int flux_metal_causal_attention(float *out,
+                                 const float *Q, const float *K, const float *V,
+                                 const int *attention_mask,
+                                 int seq, int num_q_heads, int num_kv_heads,
+                                 int head_dim, float scale) {
+    if (!g_shaders_initialized || !g_causal_attention_pipeline) {
+        return 0;  /* Shader not available, fall back to CPU */
+    }
+
+    /* Limit seq length to what the shader can handle (512 for shared memory) */
+    if (seq > 512) {
+        return 0;  /* Fall back to CPU for long sequences */
+    }
+
+    @autoreleasepool {
+        size_t q_size = (size_t)seq * num_q_heads * head_dim * sizeof(float);
+        size_t kv_size = (size_t)seq * num_kv_heads * head_dim * sizeof(float);
+        size_t out_size = q_size;
+        size_t mask_size = (size_t)seq * sizeof(int);
+
+        /* Create GPU buffers */
+        id<MTLBuffer> bufQ = pool_get_buffer(q_size);
+        id<MTLBuffer> bufK = pool_get_buffer(kv_size);
+        id<MTLBuffer> bufV = pool_get_buffer(kv_size);
+        id<MTLBuffer> bufOut = pool_get_buffer(out_size);
+        id<MTLBuffer> bufMask = attention_mask ? pool_get_buffer(mask_size) : nil;
+
+        if (!bufQ || !bufK || !bufV || !bufOut) {
+            if (bufQ) pool_release_buffer(bufQ);
+            if (bufK) pool_release_buffer(bufK);
+            if (bufV) pool_release_buffer(bufV);
+            if (bufOut) pool_release_buffer(bufOut);
+            if (bufMask) pool_release_buffer(bufMask);
+            return 0;
+        }
+
+        /* Copy input data */
+        memcpy([bufQ contents], Q, q_size);
+        memcpy([bufK contents], K, kv_size);
+        memcpy([bufV contents], V, kv_size);
+        if (attention_mask && bufMask) {
+            memcpy([bufMask contents], attention_mask, mask_size);
+        }
+
+        int use_mask = (attention_mask != NULL) ? 1 : 0;
+
+        /* Create command buffer and encode kernel */
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_causal_attention_pipeline];
+        [encoder setBuffer:bufQ offset:0 atIndex:0];
+        [encoder setBuffer:bufK offset:0 atIndex:1];
+        [encoder setBuffer:bufV offset:0 atIndex:2];
+        [encoder setBuffer:bufOut offset:0 atIndex:3];
+        if (bufMask) {
+            [encoder setBuffer:bufMask offset:0 atIndex:4];
+        } else {
+            /* Set a dummy buffer for null mask - kernel will use use_mask flag */
+            [encoder setBuffer:bufQ offset:0 atIndex:4];
+        }
+        [encoder setBytes:&seq length:sizeof(int) atIndex:5];
+        [encoder setBytes:&num_q_heads length:sizeof(int) atIndex:6];
+        [encoder setBytes:&num_kv_heads length:sizeof(int) atIndex:7];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
+        [encoder setBytes:&scale length:sizeof(float) atIndex:9];
+        [encoder setBytes:&use_mask length:sizeof(int) atIndex:10];
+
+        /* Dispatch: one threadgroup per (query_pos, head) pair
+         * Each threadgroup has threads for parallel reduction (softmax) */
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, num_q_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+
+        /* Execute and wait */
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        /* Copy output back to CPU */
+        memcpy(out, [bufOut contents], out_size);
+
+        /* Release buffers */
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufV);
+        pool_release_buffer(bufOut);
+        if (bufMask) pool_release_buffer(bufMask);
+
+        return 1;  /* Success */
     }
 }

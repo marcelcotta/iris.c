@@ -299,3 +299,149 @@ kernel void apply_rope_2d(
         }
     }
 }
+
+/* ========================================================================
+ * Fused Causal Attention for Text Encoder (Qwen3)
+ * Processes all heads in parallel with causal masking and GQA support.
+ *
+ * This kernel computes one output row per threadgroup:
+ * out[query_idx, head] = softmax(Q @ K^T * scale + causal_mask) @ V
+ *
+ * GQA: Multiple Q heads share the same K/V heads
+ * (e.g., 32 Q heads / 8 KV heads = 4 Q heads per KV)
+ * ======================================================================== */
+
+/* Fused causal attention - one threadgroup per (query_pos, head) pair
+ * Q: [seq, num_q_heads * head_dim]
+ * K: [seq, num_kv_heads * head_dim]
+ * V: [seq, num_kv_heads * head_dim]
+ * out: [seq, num_q_heads * head_dim]
+ * attn_mask: [seq] - 1 for valid tokens, 0 for padding (optional, can be null)
+ */
+kernel void causal_attention_fused(
+    device const float *Q [[buffer(0)]],
+    device const float *K [[buffer(1)]],
+    device const float *V [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    device const int *attn_mask [[buffer(4)]],  // Attention mask (1=valid, 0=padding)
+    constant int &seq [[buffer(5)]],
+    constant int &num_q_heads [[buffer(6)]],
+    constant int &num_kv_heads [[buffer(7)]],
+    constant int &head_dim [[buffer(8)]],
+    constant float &scale [[buffer(9)]],
+    constant int &use_mask [[buffer(10)]],  // Whether to apply attn_mask
+    uint3 tg_pos [[threadgroup_position_in_grid]],   // (query_idx, head_idx, 0)
+    uint3 tid_pos [[thread_position_in_threadgroup]],
+    uint3 tg_size [[threads_per_threadgroup]]
+) {
+    // Shared memory for scores and reductions
+    threadgroup float shared_scores[512];  // For attention scores (up to 512 seq len)
+    threadgroup float shared_max[256];
+    threadgroup float shared_sum[256];
+
+    int query_idx = tg_pos.x;
+    int head_idx = tg_pos.y;
+    uint tid = tid_pos.x;
+    uint threads = tg_size.x;
+
+    if (query_idx >= seq || head_idx >= num_q_heads) return;
+
+    // GQA: map Q head to KV head
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head_idx = head_idx / heads_per_kv;
+
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    // Pointers to this head's Q, K, V
+    device const float *q_row = Q + query_idx * q_dim + head_idx * head_dim;
+    device const float *K_head = K + kv_head_idx * head_dim;
+    device const float *V_head = V + kv_head_idx * head_dim;
+    device float *out_row = out + query_idx * q_dim + head_idx * head_dim;
+
+    // ========== Phase 1: Compute Q @ K^T with causal mask ==========
+    // Each thread computes scores for a subset of key positions
+    float local_max = -INFINITY;
+
+    for (int key_idx = tid; key_idx < seq; key_idx += threads) {
+        // Causal mask: only attend to positions <= query_idx
+        // Attention mask: only attend to valid tokens (mask[key_idx] != 0)
+        bool masked = (key_idx > query_idx);
+        if (use_mask && attn_mask[key_idx] == 0) {
+            masked = true;
+        }
+
+        if (masked) {
+            shared_scores[key_idx] = -INFINITY;
+        } else {
+            // Dot product: Q[query_idx, head] · K[key_idx, kv_head]
+            float dot = 0.0f;
+            device const float *k_row = K_head + key_idx * kv_dim;
+            for (int d = 0; d < head_dim; d++) {
+                dot += q_row[d] * k_row[d];
+            }
+            float score = dot * scale;
+            shared_scores[key_idx] = score;
+            local_max = max(local_max, score);
+        }
+    }
+
+    // Store local max for reduction
+    shared_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 2: Find global max (parallel reduction) ==========
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_val = shared_max[0];
+
+    // ========== Phase 3: Compute exp(score - max) and sum ==========
+    float local_sum = 0.0f;
+    for (int key_idx = tid; key_idx < seq; key_idx += threads) {
+        float score = shared_scores[key_idx];
+        if (score > -1e30f) {  // Not masked
+            float e = exp(score - max_val);
+            shared_scores[key_idx] = e;
+            local_sum += e;
+        } else {
+            shared_scores[key_idx] = 0.0f;
+        }
+    }
+
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 4: Find total sum (parallel reduction) ==========
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum = shared_sum[0];
+    float inv_sum = 1.0f / sum;
+
+    // ========== Phase 5: Normalize scores ==========
+    for (int key_idx = tid; key_idx < seq; key_idx += threads) {
+        shared_scores[key_idx] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 6: Compute output = scores @ V ==========
+    // Each thread computes a subset of output dimensions
+    for (int d = tid; d < head_dim; d += threads) {
+        float acc = 0.0f;
+        for (int key_idx = 0; key_idx < seq; key_idx++) {
+            float score = shared_scores[key_idx];
+            if (score > 0.0f) {  // Skip zeros (masked positions)
+                float v_val = V_head[key_idx * kv_dim + d];
+                acc += score * v_val;
+            }
+        }
+        out_row[d] = acc;
+    }
+}
