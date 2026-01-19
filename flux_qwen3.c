@@ -90,6 +90,12 @@ struct qwen3_model {
 
     /* Output layers storage (for extracting layers 9, 18, 27) */
     float *layer_outputs[3];  /* [seq_len, hidden] each */
+
+    /* Pre-allocated attention work buffers (avoid per-call allocation) */
+    float *attn_q_head;       /* [seq_len, head_dim] */
+    float *attn_k_head_t;     /* [head_dim, seq_len] */
+    float *attn_v_head;       /* [seq_len, head_dim] */
+    float *attn_out_head;     /* [seq_len, head_dim] */
 };
 
 /* ========================================================================
@@ -300,12 +306,11 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
      * Use BLAS/GPU for Q@K^T and scores@V matrix multiplications */
     int heads_per_kv = num_heads / num_kv_heads;
 
-    /* Temporary buffers for transposed K (per KV head) for efficient matmul */
-    float *k_t = malloc(kv_dim * seq_len * sizeof(float));
-    float *q_head = malloc(seq_len * head_dim * sizeof(float));
-    float *k_head_t = malloc(head_dim * seq_len * sizeof(float));
-    float *v_head = malloc(seq_len * head_dim * sizeof(float));
-    float *out_head = malloc(seq_len * head_dim * sizeof(float));
+    /* Use pre-allocated work buffers to avoid per-call allocation */
+    float *q_head = model->attn_q_head;
+    float *k_head_t = model->attn_k_head_t;
+    float *v_head = model->attn_v_head;
+    float *out_head = model->attn_out_head;
 
     for (int h = 0; h < num_heads; h++) {
         int kv_h = h / heads_per_kv;  /* Which KV head to use */
@@ -392,11 +397,7 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
         }
     }
 
-    free(k_t);
-    free(q_head);
-    free(k_head_t);
-    free(v_head);
-    free(out_head);
+    /* Work buffers are pre-allocated in model, no free needed */
 
     /* Output projection */
     qwen3_linear(model->hidden_state, model->attn_out, layer->attn.o_proj_weight,
@@ -684,6 +685,12 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
     model->mlp_out = malloc(seq_len * hidden * sizeof(float));
     model->norm_buf = malloc(seq_len * hidden * sizeof(float));
 
+    /* Pre-allocate attention work buffers */
+    model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_k_head_t = malloc(head_dim * seq_len * sizeof(float));
+    model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
+
     for (int i = 0; i < 3; i++) {
         model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
     }
@@ -734,6 +741,12 @@ void qwen3_model_free(qwen3_model_t *model) {
     free(model->mlp_up);
     free(model->mlp_out);
     free(model->norm_buf);
+
+    /* Free attention work buffers */
+    free(model->attn_q_head);
+    free(model->attn_k_head_t);
+    free(model->attn_v_head);
+    free(model->attn_out_head);
 
     for (int i = 0; i < 3; i++) {
         free(model->layer_outputs[i]);
