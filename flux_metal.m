@@ -1411,6 +1411,7 @@ static id<MTLComputePipelineState> g_silu_pipeline = nil;
 static id<MTLComputePipelineState> g_silu_mul_pipeline = nil;
 static id<MTLComputePipelineState> g_softmax_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_2d_pipeline = nil;
+static id<MTLComputePipelineState> g_rope_unified_pipeline = nil;
 static id<MTLComputePipelineState> g_causal_attention_pipeline = nil;
 static id<MTLComputePipelineState> g_attention_fused_pipeline = nil;
 static id<MTLComputePipelineState> g_gated_add_pipeline = nil;
@@ -1550,6 +1551,15 @@ int flux_metal_init_shaders(void) {
             g_rope_2d_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_rope_2d_pipeline) {
                 fprintf(stderr, "Metal shaders: apply_rope_2d pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"apply_rope_unified"];
+        if (func) {
+            g_rope_unified_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_rope_unified_pipeline) {
+                fprintf(stderr, "Metal shaders: apply_rope_unified pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -2108,6 +2118,97 @@ void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *s
 
         pool_release_buffer(bufCos);
         pool_release_buffer(bufSin);
+    }
+}
+
+/* GPU tensor version of unified RoPE for text+image */
+void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                           const float *txt_cos, const float *txt_sin,
+                           const float *img_cos, const float *img_sin,
+                           int seq, int img_offset, int heads, int head_dim, int axis_dim) {
+    if (!g_shaders_initialized || !g_rope_unified_pipeline || !q || !k) return;
+
+    int txt_seq = img_offset;
+    int img_seq = seq - img_offset;
+
+    @autoreleasepool {
+        size_t txt_freq_size = (size_t)txt_seq * head_dim * sizeof(float);
+        size_t img_freq_size = (size_t)img_seq * head_dim * sizeof(float);
+
+        id<MTLBuffer> bufTxtCos = pool_get_buffer(txt_freq_size);
+        id<MTLBuffer> bufTxtSin = pool_get_buffer(txt_freq_size);
+        id<MTLBuffer> bufImgCos = pool_get_buffer(img_freq_size);
+        id<MTLBuffer> bufImgSin = pool_get_buffer(img_freq_size);
+
+        if (!bufTxtCos || !bufTxtSin || !bufImgCos || !bufImgSin) {
+            if (bufTxtCos) pool_release_buffer(bufTxtCos);
+            if (bufTxtSin) pool_release_buffer(bufTxtSin);
+            if (bufImgCos) pool_release_buffer(bufImgCos);
+            if (bufImgSin) pool_release_buffer(bufImgSin);
+            return;
+        }
+
+        memcpy([bufTxtCos contents], txt_cos, txt_freq_size);
+        memcpy([bufTxtSin contents], txt_sin, txt_freq_size);
+        memcpy([bufImgCos contents], img_cos, img_freq_size);
+        memcpy([bufImgSin contents], img_sin, img_freq_size);
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+
+        /* Apply unified RoPE to Q */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_rope_unified_pipeline];
+            [encoder setBuffer:q->buffer offset:0 atIndex:0];
+            [encoder setBuffer:bufTxtCos offset:0 atIndex:1];
+            [encoder setBuffer:bufTxtSin offset:0 atIndex:2];
+            [encoder setBuffer:bufImgCos offset:0 atIndex:3];
+            [encoder setBuffer:bufImgSin offset:0 atIndex:4];
+            [encoder setBytes:&seq length:sizeof(int) atIndex:5];
+            [encoder setBytes:&img_offset length:sizeof(int) atIndex:6];
+            [encoder setBytes:&heads length:sizeof(int) atIndex:7];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
+            [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
+
+            [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+               threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+            [encoder endEncoding];
+        }
+
+        /* Apply unified RoPE to K */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_rope_unified_pipeline];
+            [encoder setBuffer:k->buffer offset:0 atIndex:0];
+            [encoder setBuffer:bufTxtCos offset:0 atIndex:1];
+            [encoder setBuffer:bufTxtSin offset:0 atIndex:2];
+            [encoder setBuffer:bufImgCos offset:0 atIndex:3];
+            [encoder setBuffer:bufImgSin offset:0 atIndex:4];
+            [encoder setBytes:&seq length:sizeof(int) atIndex:5];
+            [encoder setBytes:&img_offset length:sizeof(int) atIndex:6];
+            [encoder setBytes:&heads length:sizeof(int) atIndex:7];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
+            [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
+
+            [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+               threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+            [encoder endEncoding];
+        }
+
+        q->has_pending_work = 1;
+        k->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            q->has_pending_work = 0;
+            k->has_pending_work = 0;
+        }
+
+        pool_release_buffer(bufTxtCos);
+        pool_release_buffer(bufTxtSin);
+        pool_release_buffer(bufImgCos);
+        pool_release_buffer(bufImgSin);
     }
 }
 

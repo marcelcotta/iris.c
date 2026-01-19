@@ -396,6 +396,69 @@ kernel void apply_rope_2d(
 }
 
 /* ========================================================================
+ * Unified RoPE for Text+Image (Single Block Forward)
+ * Applies different frequency tables to text and image portions in one pass.
+ * Text portion: positions [0, img_offset)
+ * Image portion: positions [img_offset, seq)
+ * ======================================================================== */
+kernel void apply_rope_unified(
+    device float *x [[buffer(0)]],
+    device const float *txt_cos [[buffer(1)]],
+    device const float *txt_sin [[buffer(2)]],
+    device const float *img_cos [[buffer(3)]],
+    device const float *img_sin [[buffer(4)]],
+    constant int &seq [[buffer(5)]],
+    constant int &img_offset [[buffer(6)]],
+    constant int &heads [[buffer(7)]],
+    constant int &head_dim [[buffer(8)]],
+    constant int &axis_dim [[buffer(9)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint seq_idx = pos.x;
+    uint head_idx = pos.y;
+
+    if (seq_idx >= uint(seq) || head_idx >= uint(heads)) return;
+
+    uint hidden = heads * head_dim;
+    device float *vec = x + seq_idx * hidden + head_idx * head_dim;
+
+    // Select appropriate frequency table based on position
+    device const float *cos_row;
+    device const float *sin_row;
+
+    if (seq_idx < uint(img_offset)) {
+        // Text portion: use text frequencies indexed by seq_idx
+        cos_row = txt_cos + seq_idx * head_dim;
+        sin_row = txt_sin + seq_idx * head_dim;
+    } else {
+        // Image portion: use image frequencies indexed by (seq_idx - img_offset)
+        uint img_idx = seq_idx - uint(img_offset);
+        cos_row = img_cos + img_idx * head_dim;
+        sin_row = img_sin + img_idx * head_dim;
+    }
+
+    // RoPE rotation for each axis (4 axes of 32 dims each = 128)
+    int half_axis = axis_dim / 2;
+
+    for (int axis = 0; axis < 4; axis++) {
+        int axis_offset = axis * axis_dim;
+        for (int d = 0; d < half_axis; d++) {
+            int i0 = axis_offset + d;
+            int i1 = axis_offset + half_axis + d;
+
+            float c = cos_row[i0];
+            float s = sin_row[i0];
+
+            float x0 = vec[i0];
+            float x1 = vec[i1];
+
+            vec[i0] = x0 * c - x1 * s;
+            vec[i1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+/* ========================================================================
  * Fused Non-Causal Attention for Transformer (FLUX)
  * Processes all heads in parallel without causal masking.
  *

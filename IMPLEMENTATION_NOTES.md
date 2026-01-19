@@ -196,18 +196,18 @@ Output: updated hidden states
 |-----------|------|-------|
 | Model loading | ~5.0s | Disk I/O + weight caching |
 | Text encoding | ~3.0s | GPU causal attention |
-| Denoising | ~7.4s | GPU attention, GPU softmax |
+| Denoising | ~6.0s | Full GPU pipeline |
 | VAE decode | ~2.0s | CPU BLAS |
-| **Total** | ~17s | Wall clock (overlapping GPU/CPU) |
+| **Total** | ~16s | Wall clock (overlapping GPU/CPU) |
 
 **Denoising Breakdown (per step after warmup):**
 
 | Component | Time | % |
 |-----------|------|---|
-| Single blocks (20) | ~500ms | 67% |
-| Double blocks (5) | ~250ms | 32% |
+| Single blocks (20) | ~380ms | 63% |
+| Double blocks (5) | ~225ms | 37% |
 | Final layer | ~3ms | <1% |
-| **Per step total** | ~750ms | |
+| **Per step total** | ~600ms | |
 
 Note: Step 1 has ~5s GPU warmup overhead (buffer allocation, shader compilation).
 
@@ -215,7 +215,7 @@ Note: Step 1 has ~5s GPU warmup overhead (buffer allocation, shader compilation)
 
 | Size | C Implementation | PyTorch | Gap |
 |------|-----------------|---------|-----|
-| 256×256 | ~17s | ~3s | 5.7x |
+| 256×256 | ~16s | ~3s | 5.3x |
 | 512×512 | ~50s | ~5.4s | 9x |
 
 ### Optimization History
@@ -275,7 +275,7 @@ Note: Step 1 has ~5s GPU warmup overhead (buffer allocation, shader compilation)
 - 80 calls per 256×256 generation = 10.4GB allocation saved
 - **Impact: Total time 24s → 22.4s (7% faster)**
 
-#### 10. Fused Non-Causal Attention Kernel (Latest)
+#### 10. Fused Non-Causal Attention Kernel
 - New Metal kernel: `attention_fused`
 - Operates directly on [seq, hidden] layout without CPU transpose
 - Used in both self-attention (single blocks) and joint attention (double blocks)
@@ -288,7 +288,25 @@ Note: Step 1 has ~5s GPU warmup overhead (buffer allocation, shader compilation)
 - Attention: 768²×128×24×2 ≈ 3.6M FLOPs (18x smaller)
 - The transpose overhead saved (~4ms per step) is small compared to total
 
-**Correctness**: Max pixel diff = 1, mean = 0.008 (identical to reference)
+#### 11. Full GPU Pipeline for Single Blocks (Latest)
+- New Metal kernel: `apply_rope_unified` for combined text+image RoPE
+- Keeps entire single block computation on GPU without CPU sync points
+- GPU operations chained: AdaLN → QKV+MLP projection → split → QK norm → RoPE → attention → SwiGLU → concat → projection → gated add
+- Only syncs at block boundaries (not mid-block)
+- **Impact: ~15% total denoising improvement, ~20% for single blocks**
+
+**Implementation details:**
+- `apply_rope_unified`: Handles text (positions 0 to img_offset) and image (positions img_offset to seq) with different frequency tables in one kernel call
+- `flux_gpu_rope_unified()`: Applies unified RoPE to both Q and K tensors
+- `single_block_forward_gpu()`: Full GPU pipeline with fallback to CPU for edge cases
+
+**Before/After (256×256, 4 steps):**
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Total denoising | 7.18s | 6.06s | 15% |
+| Single blocks | 4706ms | 3765ms | 20% |
+
+**Correctness**: Output images visually identical to CPU path
 
 ### GPU Infrastructure
 
@@ -314,21 +332,21 @@ Note: Step 1 has ~5s GPU warmup overhead (buffer allocation, shader compilation)
 
 ### Remaining Optimization Opportunities
 
-**Key insight**: Linear projections account for ~95% of single block compute. Attention is only ~5%. The main bottleneck is memory bandwidth from CPU↔GPU copies for each matmul.
+**Key insight**: Single blocks now run with full GPU pipeline (optimization #11), eliminating most CPU↔GPU sync points. Double blocks and VAE are the main remaining targets.
 
 **High-impact optimizations:**
 
-1. **Persistent GPU activations**: Keep intermediate tensors on GPU throughout a transformer block instead of copying back to CPU after each matmul. Would eliminate ~80% of memory copies.
+1. **Full GPU pipeline for double blocks**: Similar to single blocks - keep img/txt streams on GPU throughout the block. Currently double blocks still use CPU for some operations.
 
-2. **Fused linear kernels**: Combine sequences like linear → activation → linear into single GPU operations to reduce sync points.
+2. **bf16 compute pipeline**: Use half precision throughout instead of converting bf16 weights to f32 for compute. Would double effective memory bandwidth.
 
-3. **bf16 compute pipeline**: Use half precision throughout instead of converting bf16 weights to f32 for compute. Would double effective memory bandwidth.
+3. **VAE Decoder on GPU**: Currently CPU-only with BLAS, ~2s overhead. Moving convolutions to GPU could provide significant speedup.
 
 **Lower-impact optimizations:**
 
-4. **VAE Decoder on GPU**: Currently CPU-only, ~2s overhead
-5. **Flash Attention**: Tiled attention for O(n) memory instead of O(n²)
-6. **First-step warmup**: GPU shader compilation adds ~5s to first step
+4. **Flash Attention**: Tiled attention for O(n) memory instead of O(n²)
+5. **First-step warmup**: GPU shader compilation adds ~5s to first step - could pre-warm shaders
+6. **Fused linear kernels**: Combine sequences like linear → activation → linear into single GPU operations
 
 ---
 
@@ -369,12 +387,17 @@ void flux_metal_attention(float *out,
                           int heads, int seq_q, int seq_k, int head_dim,
                           float scale);
 
-// Fused transformer attention (no transpose needed) - NEW
+// Fused transformer attention (no transpose needed)
 // Works directly on [seq, hidden] layout
 int flux_metal_attention_fused(float *out,
                                const float *Q, const float *K, const float *V,
                                int seq_q, int seq_k, int num_heads, int head_dim,
                                float scale);
+
+// GPU tensor version of fused attention
+int flux_gpu_attention_fused(flux_gpu_tensor_t out,
+                             flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                             int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 // Text encoder causal attention (fused kernel, all heads parallel)
 int flux_metal_causal_attention(float *out,
@@ -382,6 +405,52 @@ int flux_metal_causal_attention(float *out,
                                  const int *attention_mask,
                                  int seq, int num_q_heads, int num_kv_heads,
                                  int head_dim, float scale);
+```
+
+### GPU Tensor Operations
+
+```c
+// Linear layer with bf16 weights (returns new tensor)
+flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
+                                        const uint16_t *W_bf16,
+                                        int seq_len, int in_dim, int out_dim);
+
+// AdaLN normalization: out = (1 + scale) * norm(x) + shift
+void flux_gpu_adaln_norm(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                         const float *shift, const float *scale,
+                         int seq, int hidden, float eps);
+
+// QK RMSNorm (in-place on Q and K)
+void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                          const float *q_weight, const float *k_weight,
+                          int seq, int heads, int head_dim, float eps);
+
+// Standard RoPE (single frequency table)
+void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
+                      int seq, int heads, int head_dim, int axis_dim);
+
+// Unified RoPE for text+image (different frequencies for each portion)
+void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                           const float *txt_cos, const float *txt_sin,
+                           const float *img_cos, const float *img_sin,
+                           int seq, int img_offset, int heads, int head_dim, int axis_dim);
+
+// SwiGLU activation: gate = silu(gate) * up
+void flux_gpu_silu_mul(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
+
+// Gated residual: out += gate * proj
+void flux_gpu_gated_add(flux_gpu_tensor_t out, const float *gate,
+                        flux_gpu_tensor_t proj, int seq, int hidden);
+
+// Split fused QKV+MLP output
+void flux_gpu_split_qkv_mlp(flux_gpu_tensor_t fused,
+                            flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
+                            flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+                            int seq, int hidden, int mlp_hidden);
+
+// Concatenate attention and MLP outputs
+void flux_gpu_concat_attn_mlp(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
+                              flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
 ```
 
 ### Text Encoder API
@@ -498,12 +567,21 @@ gcc $CFLAGS -DDEBUG_TRANSFORMER -DDEBUG_DOUBLE_BLOCK -c flux_transformer.c
   - 21% faster text encoding, 33% faster total
 - Added operation chain API
 - Updated flux_metal_attention to use buffer pool
+- Implemented `attention_fused` kernel (no transpose needed)
+- Pre-allocated transformer work buffers (7% improvement)
+- **Implemented full GPU pipeline for single blocks**
+  - New `apply_rope_unified` kernel for combined text+image RoPE
+  - New `flux_gpu_rope_unified()` wrapper function
+  - `single_block_forward_gpu()` keeps entire block on GPU
+  - GPU ops: AdaLN → proj → split → QK norm → RoPE → attention → SwiGLU → concat → proj → gated add
+  - 15% total denoising improvement, 20% for single blocks
 
 **Current commits:**
 - `fc419de` - Strided BLAS access
 - `828125c` - Fused GPU softmax
 - `551f8fe` - GPU for text encoder FFN
 - `050421f` - Pre-allocated attention buffers
+- `0b16941` - Fix compiler warnings
 
 ---
 

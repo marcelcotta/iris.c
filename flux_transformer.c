@@ -1181,8 +1181,6 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     int heads = tf->num_heads;
     int head_dim = tf->head_dim;
     int mlp_hidden = tf->mlp_hidden;
-    int img_seq = seq - img_offset;
-    int txt_seq = img_offset;
     float eps = 1e-6f;
     int axis_dim = 32;
 
@@ -1273,66 +1271,61 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     flux_gpu_qk_rms_norm(q_gpu, k_gpu, block->norm_q_weight, block->norm_k_weight,
                          seq, heads, head_dim, eps);
 
-    /* === Phase 7: Apply RoPE - need to sync and do on CPU for text/image split === */
-    /* End batch to sync before RoPE (which needs different freqs for text vs image) */
-    flux_gpu_batch_end();
+    /* === Phase 7: Apply unified RoPE on GPU (handles text+image in one call) === */
+    flux_gpu_rope_unified(q_gpu, k_gpu,
+                          txt_rope_cos, txt_rope_sin,
+                          img_rope_cos, img_rope_sin,
+                          seq, img_offset, heads, head_dim, axis_dim);
 
-    /* Read Q and K back to CPU for RoPE */
-    float *q_cpu = tf->single_q;
-    float *k_cpu = tf->single_k;
-    flux_gpu_tensor_read(q_gpu, q_cpu);
-    flux_gpu_tensor_read(k_gpu, k_cpu);
-
-    /* Apply RoPE on CPU (different frequencies for text vs image) */
-    apply_rope_2d(q_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(k_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(q_cpu + img_offset * h_size, img_rope_cos, img_rope_sin,
-                  img_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(k_cpu + img_offset * h_size, img_rope_cos, img_rope_sin,
-                  img_seq, heads, head_dim, axis_dim);
-
-    /* Copy RoPE'd Q, K back to GPU tensors */
-    memcpy(flux_gpu_tensor_data(q_gpu), q_cpu, seq * h_size * sizeof(float));
-    memcpy(flux_gpu_tensor_data(k_gpu), k_cpu, seq * h_size * sizeof(float));
-
-    /* Read V to CPU for attention (our attention kernel needs all tensors fresh) */
-    float *v_cpu = tf->single_v;
-    flux_gpu_tensor_read(v_gpu, v_cpu);
-
-    /* === Phase 8: Self-attention (use existing fused kernel) === */
-    float *attn_out_cpu = tf->single_attn_out;
+    /* === Phase 8: Self-attention on GPU === */
     float attn_scale = 1.0f / sqrtf((float)head_dim);
-    if (!flux_metal_attention_fused(attn_out_cpu, q_cpu, k_cpu, v_cpu,
-                                    seq, seq, heads, head_dim, attn_scale)) {
-        /* Fall back to CPU attention */
+    if (!flux_gpu_attention_fused(attn_out_gpu, q_gpu, k_gpu, v_gpu,
+                                  seq, seq, heads, head_dim, attn_scale)) {
+        /* Fall back to CPU attention - need to sync and copy */
+        flux_gpu_batch_end();
+        float *q_cpu = tf->single_q;
+        float *k_cpu = tf->single_k;
+        float *v_cpu = tf->single_v;
+        flux_gpu_tensor_read(q_gpu, q_cpu);
+        flux_gpu_tensor_read(k_gpu, k_cpu);
+        flux_gpu_tensor_read(v_gpu, v_cpu);
+        float *attn_out_cpu = tf->single_attn_out;
         mha_forward(attn_out_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
+        memcpy(flux_gpu_tensor_data(attn_out_gpu), attn_out_cpu, seq * h_size * sizeof(float));
+        flux_gpu_batch_begin();
     }
 
-    /* === Phase 9: SwiGLU on CPU (read gate/up, apply, write back) === */
-    float *mlp_gate = tf->single_mlp_gate;
-    float *mlp_up = tf->single_mlp_up;
-    flux_gpu_tensor_read(gate_gpu, mlp_gate);
-    flux_gpu_tensor_read(up_gpu, mlp_up);
+    /* === Phase 9: SwiGLU on GPU === */
+    flux_gpu_silu_mul(gate_gpu, up_gpu, seq * mlp_hidden);
 
-    flux_silu(mlp_gate, seq * mlp_hidden);
-    flux_mul_inplace(mlp_gate, mlp_up, seq * mlp_hidden);
+    /* === Phase 10: Concat attention + MLP outputs on GPU === */
+    flux_gpu_concat_attn_mlp(attn_out_gpu, gate_gpu, concat_gpu, seq, h_size, mlp_hidden);
 
-    /* === Phase 10: Concat and final projection === */
-    float *concat_cpu = tf->single_concat;
-    for (int s = 0; s < seq; s++) {
-        memcpy(concat_cpu + s * (h_size + mlp_hidden),
-               attn_out_cpu + s * h_size, h_size * sizeof(float));
-        memcpy(concat_cpu + s * (h_size + mlp_hidden) + h_size,
-               mlp_gate + s * mlp_hidden, mlp_hidden * sizeof(float));
+    /* === Phase 11: Final projection on GPU === */
+    /* Free pre-allocated tensor since linear returns a new one */
+    flux_gpu_tensor_free(proj_out_gpu);
+    proj_out_gpu = flux_gpu_linear_bf16(concat_gpu, block->proj_mlp_weight_bf16,
+                                        seq, h_size + mlp_hidden, h_size);
+    if (!proj_out_gpu) {
+        /* Fall back to CPU projection */
+        flux_gpu_batch_end();
+        float *concat_cpu = tf->single_concat;
+        flux_gpu_tensor_read(concat_gpu, concat_cpu);
+        float *proj_out_cpu = tf->work1;
+        flux_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
+                                seq, h_size + mlp_hidden, h_size);
+        gated_add(hidden, gate, proj_out_cpu, seq, h_size);
+        goto cleanup;
     }
 
-    float *proj_out_cpu = tf->work1;
-    flux_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
-                            seq, h_size + mlp_hidden, h_size);
+    /* === Phase 12: Gated add residual on GPU === */
+    flux_gpu_gated_add(hidden_gpu, gate, proj_out_gpu, seq, h_size);
 
-    /* === Phase 11: Gated add residual === */
-    gated_add(hidden, gate, proj_out_cpu, seq, h_size);
+    /* === Phase 13: Sync and copy result back === */
+    flux_gpu_batch_end();
+    flux_gpu_tensor_read(hidden_gpu, hidden);
 
+cleanup:
     /* === Cleanup GPU tensors === */
     flux_gpu_tensor_free(hidden_gpu);
     flux_gpu_tensor_free(norm_gpu);

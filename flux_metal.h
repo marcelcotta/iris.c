@@ -251,6 +251,12 @@ void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
 void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
                       int seq, int heads, int head_dim, int axis_dim);
 
+/* Unified RoPE for text+image: applies different frequencies to text/image portions */
+void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                           const float *txt_cos, const float *txt_sin,
+                           const float *img_cos, const float *img_sin,
+                           int seq, int img_offset, int heads, int head_dim, int axis_dim);
+
 /* SiLU multiply on GPU: gate = silu(gate) * up */
 void flux_gpu_silu_mul(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
 
