@@ -61,7 +61,7 @@ ifeq ($(UNAME_S),Darwin)
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
 else
-blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS
+blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 blas: LDFLAGS += -lopenblas
 endif
 blas: clean $(TARGET)
