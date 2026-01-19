@@ -537,6 +537,26 @@ gcc $CFLAGS -DDEBUG_TRANSFORMER -DDEBUG_DOUBLE_BLOCK -c flux_transformer.c
 1. **Final Layer scale/shift order**: Changed (shift, scale) → (scale, shift)
 2. **K/V concatenation order**: Changed [IMAGE, TEXT] → [TEXT, IMAGE]
 3. **Text sequence length**: Aligned Python and C to 512 tokens
+4. **Unified RoPE kernel indexing** (2024-01-19): GPU kernel used axis-based pair indexing `(i0, i0+half_axis)` while CPU used consecutive pairs `(d, d+1)`. Fixed GPU to match CPU.
+5. **GPU caching of timestep-dependent parameters** (2024-01-19): `flux_gpu_adaln_norm()` and `flux_gpu_gated_add()` used `get_cached_weight_buffer()` for shift/scale/gate parameters. These change each denoising step, but cache returned stale values from step 1. **Symptoms**: Step 2+ ran ~14x faster, output images had "uncertain borders". **Fix**: Allocate fresh buffers with `newBufferWithBytes` instead of using weight cache.
+
+### Testing
+
+**Primary test**: 2-step denoising to catch multi-step state bugs:
+```bash
+./flux -d flux-klein-model -p "A fluffy orange cat sitting on a windowsill" \
+  --seed 42 --steps 2 -o /tmp/test.png -W 64 -H 64
+
+python3 -c "
+import numpy as np; from PIL import Image
+ref = np.array(Image.open('test_vectors/reference_2step_64x64_seed42.png'))
+test = np.array(Image.open('/tmp/test.png'))
+diff = np.abs(ref.astype(float) - test.astype(float))
+print('PASS' if diff.max() < 2 else 'FAIL')
+"
+```
+
+The 2-step test catches bugs that 1-step tests miss (e.g., caching issues between steps).
 
 ---
 
