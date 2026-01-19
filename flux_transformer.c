@@ -20,6 +20,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+
+/* External timing counters from flux_sample.c */
+extern double flux_timing_transformer_total;
+extern double flux_timing_transformer_double;
+extern double flux_timing_transformer_single;
+extern double flux_timing_transformer_final;
+
+/* Helper to get current time in ms */
+static double tf_get_time_ms(void) {
+    return (double)clock() * 1000.0 / CLOCKS_PER_SEC;
+}
 
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
@@ -45,6 +57,18 @@
             flux_linear_nobias((out), (x), (w_f32), (seq), (in_dim), (out_dim)); \
         } \
     } while(0)
+
+/* Gated add: out += gate * proj, where gate is [hidden] and proj is [seq, hidden]
+ * Double loop avoids modulo which prevents vectorization.
+ */
+static inline void gated_add(float *out, const float *gate, const float *proj,
+                             int seq, int hidden) {
+    for (int s = 0; s < seq; s++) {
+        for (int i = 0; i < hidden; i++) {
+            out[s * hidden + i] += gate[i] * proj[s * hidden + i];
+        }
+    }
+}
 
 /* ========================================================================
  * Transformer Data Structures
@@ -184,6 +208,26 @@ typedef struct flux_transformer {
     float *attn_scores;             /* [max_seq, max_seq] attention scores */
     float *attn_cat_k;              /* [max_seq, hidden] concatenated K */
     float *attn_cat_v;              /* [max_seq, hidden] concatenated V */
+
+    /* Single-block work buffers (pre-allocated to avoid malloc in hot path) */
+    float *single_q;                /* [max_seq, hidden] */
+    float *single_k;                /* [max_seq, hidden] */
+    float *single_v;                /* [max_seq, hidden] */
+    float *single_mlp_gate;         /* [max_seq, mlp_hidden] */
+    float *single_mlp_up;           /* [max_seq, mlp_hidden] */
+    float *single_attn_out;         /* [max_seq, hidden] */
+    float *single_concat;           /* [max_seq, hidden + mlp_hidden] */
+
+    /* FFN work buffers (shared by double and single blocks) */
+    float *ffn_gate;                /* [max_seq, mlp_hidden] */
+    float *ffn_up;                  /* [max_seq, mlp_hidden] */
+
+    /* Double-block work buffers */
+    float *t_emb_silu;              /* [hidden] */
+    float *double_mod_img;          /* [hidden * 6] */
+    float *double_mod_txt;          /* [hidden * 6] */
+    float *double_img_attn_out;     /* [max_seq, hidden] */
+    float *double_txt_attn_out;     /* [max_seq, hidden] */
 } flux_transformer_t;
 
 /* Forward declarations */
@@ -560,6 +604,15 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
     float scale = 1.0f / sqrtf((float)head_dim);
     (void)heads; /* hidden = heads * head_dim, but we use tf->hidden_size */
 
+#ifdef USE_METAL
+    /* Try fused attention kernel first - operates directly on [seq, hidden] layout
+     * This avoids CPU transpose overhead */
+    if (flux_metal_attention_fused(out, q, k, v, seq, seq, tf->num_heads, head_dim, scale)) {
+        return;  /* Success - no transpose needed */
+    }
+#endif
+
+    /* Fallback: transpose-based approach */
     /* Use pre-allocated buffers from transformer */
     float *q_t = tf->attn_q_t;
     float *k_t = tf->attn_k_t;
@@ -667,6 +720,18 @@ static void joint_attention(float *img_out, float *txt_out,
     memcpy(cat_k + txt_seq * hidden, img_k, img_seq * hidden * sizeof(float));
     memcpy(cat_v + txt_seq * hidden, img_v, img_seq * hidden * sizeof(float));
 
+#ifdef USE_METAL
+    /* Try fused attention kernel first - operates directly on [seq, hidden] layout
+     * This avoids CPU transpose overhead */
+    if (flux_metal_attention_fused(img_out, img_q, cat_k, cat_v,
+                                   img_seq, total_seq, heads, head_dim, scale) &&
+        flux_metal_attention_fused(txt_out, txt_q, cat_k, cat_v,
+                                   txt_seq, total_seq, heads, head_dim, scale)) {
+        return;  /* Success - no transpose needed */
+    }
+#endif
+
+    /* Fallback: transpose-based approach */
     /* Use pre-allocated buffers for transposed data
      * Layout: attn_q_t holds [img_q_t, txt_q_t], attn_k_t holds cat_k_t, etc.
      */
@@ -824,16 +889,18 @@ static void joint_attention(float *img_out, float *txt_out,
  * SwiGLU FFN
  * ======================================================================== */
 
-/* SwiGLU FFN with optional bf16 weights */
+/* SwiGLU FFN with optional bf16 weights - uses pre-allocated buffers from tf */
 static void swiglu_ffn_bf16(float *out, const float *x,
                             const float *gate_weight, const float *up_weight,
                             const float *down_weight,
                             const uint16_t *gate_weight_bf16,
                             const uint16_t *up_weight_bf16,
                             const uint16_t *down_weight_bf16,
-                            int seq, int hidden, int mlp_hidden) {
-    float *gate = (float *)malloc(seq * mlp_hidden * sizeof(float));
-    float *up = (float *)malloc(seq * mlp_hidden * sizeof(float));
+                            int seq, int hidden, int mlp_hidden,
+                            flux_transformer_t *tf) {
+    /* Use pre-allocated FFN work buffers */
+    float *gate = tf->ffn_gate;
+    float *up = tf->ffn_up;
 
     /* Gate and up projections - these are independent, batch them */
     flux_gpu_begin_batch();
@@ -848,8 +915,7 @@ static void swiglu_ffn_bf16(float *out, const float *x,
     /* Down projection */
     LINEAR_BF16_OR_F32(out, gate, down_weight, down_weight_bf16, seq, mlp_hidden, hidden);
 
-    free(gate);
-    free(up);
+    /* No free - using pre-allocated buffers */
 }
 
 /* ========================================================================
@@ -878,15 +944,15 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
      */
     int mod_size = hidden * 6;
 
-    /* Apply SiLU to t_emb for modulation (FLUX architecture requirement) */
-    float *t_emb_silu = (float *)malloc(hidden * sizeof(float));
+    /* Apply SiLU to t_emb for modulation - use pre-allocated buffer */
+    float *t_emb_silu = tf->t_emb_silu;
     for (int i = 0; i < hidden; i++) {
         float x = t_emb[i];
         t_emb_silu[i] = x / (1.0f + expf(-x));  /* SiLU = x * sigmoid(x) */
     }
 
-    /* Image stream modulation */
-    float *img_mod = (float *)malloc(mod_size * sizeof(float));
+    /* Image stream modulation - use pre-allocated buffer */
+    float *img_mod = tf->double_mod_img;
     flux_linear_nobias(img_mod, t_emb_silu, img_adaln_weight, 1, hidden, mod_size);
 
     float *img_shift1 = img_mod;
@@ -896,11 +962,9 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     float *img_scale2 = img_mod + hidden * 4;
     float *img_gate2 = img_mod + hidden * 5;
 
-    /* Text stream modulation */
-    float *txt_mod = (float *)malloc(mod_size * sizeof(float));
+    /* Text stream modulation - use pre-allocated buffer */
+    float *txt_mod = tf->double_mod_txt;
     flux_linear_nobias(txt_mod, t_emb_silu, txt_adaln_weight, 1, hidden, mod_size);
-
-    free(t_emb_silu);
 
     float *txt_shift1 = txt_mod;
     float *txt_scale1 = txt_mod + hidden;
@@ -989,9 +1053,9 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     apply_rope_2d(txt_q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
     apply_rope_2d(txt_k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
 
-    /* Joint attention */
-    float *img_attn_out = (float *)malloc(img_seq * hidden * sizeof(float));
-    float *txt_attn_out = (float *)malloc(txt_seq * hidden * sizeof(float));
+    /* Joint attention - use pre-allocated buffers */
+    float *img_attn_out = tf->double_img_attn_out;
+    float *txt_attn_out = tf->double_txt_attn_out;
 
     joint_attention(img_attn_out, txt_attn_out,
                     img_q, img_k, img_v,
@@ -1029,13 +1093,9 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     }
 #endif
 
-    /* Apply gate and add residual */
-    for (int i = 0; i < img_seq * hidden; i++) {
-        img_hidden[i] += img_gate1[i % hidden] * img_proj[i];
-    }
-    for (int i = 0; i < txt_seq * hidden; i++) {
-        txt_hidden[i] += txt_gate1[i % hidden] * txt_proj[i];
-    }
+    /* Apply gate and add residual - use vectorized helper */
+    gated_add(img_hidden, img_gate1, img_proj, img_seq, hidden);
+    gated_add(txt_hidden, txt_gate1, txt_proj, txt_seq, hidden);
 
 #ifdef DEBUG_DOUBLE_BLOCK
     if (block_idx == 0) {
@@ -1061,7 +1121,7 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
                     block->img_mlp_down_weight,
                     block->img_mlp_gate_weight_bf16, block->img_mlp_up_weight_bf16,
                     block->img_mlp_down_weight_bf16,
-                    img_seq, hidden, mlp_hidden);
+                    img_seq, hidden, mlp_hidden, tf);
 
 #ifdef DEBUG_DOUBLE_BLOCK
     if (block_idx == 0) {
@@ -1074,9 +1134,7 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     }
 #endif
 
-    for (int i = 0; i < img_seq * hidden; i++) {
-        img_hidden[i] += img_gate2[i % hidden] * img_proj[i];
-    }
+    gated_add(img_hidden, img_gate2, img_proj, img_seq, hidden);
 
 #ifdef DEBUG_DOUBLE_BLOCK
     fprintf(stderr, "[DBL%d] After FFN residual img_hidden[0,0,:5]: ", block_idx);
@@ -1091,15 +1149,10 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
                     block->txt_mlp_down_weight,
                     block->txt_mlp_gate_weight_bf16, block->txt_mlp_up_weight_bf16,
                     block->txt_mlp_down_weight_bf16,
-                    txt_seq, hidden, mlp_hidden);
-    for (int i = 0; i < txt_seq * hidden; i++) {
-        txt_hidden[i] += txt_gate2[i % hidden] * txt_proj[i];
-    }
+                    txt_seq, hidden, mlp_hidden, tf);
+    gated_add(txt_hidden, txt_gate2, txt_proj, txt_seq, hidden);
 
-    free(img_mod);
-    free(txt_mod);
-    free(img_attn_out);
-    free(txt_attn_out);
+    /* No free - using pre-allocated buffers */
 
 #ifdef DEBUG_DOUBLE_BLOCK
     block_idx++;
@@ -1131,16 +1184,16 @@ static void single_block_forward(float *hidden, const single_block_t *block,
      */
     int mod_size = h_size * 3;
 
-    /* Apply SiLU to t_emb for modulation */
-    float *t_emb_silu = (float *)malloc(h_size * sizeof(float));
+    /* Apply SiLU to t_emb for modulation - use pre-allocated buffer */
+    float *t_emb_silu = tf->t_emb_silu;
     for (int i = 0; i < h_size; i++) {
         float x = t_emb[i];
         t_emb_silu[i] = x / (1.0f + expf(-x));
     }
 
-    float *mod_params = (float *)malloc(mod_size * sizeof(float));
+    /* Use end of work2 for mod_params (3*hidden = 9216 floats, work2 has max_seq*hidden*4) */
+    float *mod_params = tf->work2 + tf->max_seq_len * h_size * 3;
     flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
-    free(t_emb_silu);
 
     float *shift = mod_params;
     float *scale = mod_params + h_size;
@@ -1159,25 +1212,23 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     LINEAR_BF16_OR_F32(fused_out, norm, block->qkv_mlp_weight, block->qkv_mlp_weight_bf16,
                        seq, h_size, fused_dim);
 
-    /* Split outputs: need to de-interleave from [seq, fused_dim] format
+    /* Split outputs: use pre-allocated buffers
      * Each position has [Q, K, V, gate, up] concatenated
      */
-    float *q = (float *)malloc(seq * h_size * sizeof(float));
-    float *k = (float *)malloc(seq * h_size * sizeof(float));
-    float *v = (float *)malloc(seq * h_size * sizeof(float));
-    float *mlp_gate_split = (float *)malloc(seq * mlp_hidden * sizeof(float));
-    float *mlp_up_split = (float *)malloc(seq * mlp_hidden * sizeof(float));
+    float *q = tf->single_q;
+    float *k = tf->single_k;
+    float *v = tf->single_v;
+    float *mlp_gate = tf->single_mlp_gate;
+    float *mlp_up = tf->single_mlp_up;
 
     for (int s = 0; s < seq; s++) {
         float *row = fused_out + s * fused_dim;
         memcpy(q + s * h_size, row, h_size * sizeof(float));
         memcpy(k + s * h_size, row + h_size, h_size * sizeof(float));
         memcpy(v + s * h_size, row + h_size * 2, h_size * sizeof(float));
-        memcpy(mlp_gate_split + s * mlp_hidden, row + h_size * 3, mlp_hidden * sizeof(float));
-        memcpy(mlp_up_split + s * mlp_hidden, row + h_size * 3 + mlp_hidden, mlp_hidden * sizeof(float));
+        memcpy(mlp_gate + s * mlp_hidden, row + h_size * 3, mlp_hidden * sizeof(float));
+        memcpy(mlp_up + s * mlp_hidden, row + h_size * 3 + mlp_hidden, mlp_hidden * sizeof(float));
     }
-    float *mlp_gate = mlp_gate_split;
-    float *mlp_up = mlp_up_split;
 
     /* Apply QK normalization */
     apply_qk_norm(q, k, block->norm_q_weight, block->norm_k_weight,
@@ -1200,8 +1251,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
     apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
 
-    /* Self-attention */
-    float *attn_out = (float *)malloc(seq * h_size * sizeof(float));
+    /* Self-attention - use pre-allocated buffer */
+    float *attn_out = tf->single_attn_out;
     mha_forward(attn_out, q, k, v, seq, heads, head_dim, tf);
 
     /* SwiGLU: silu(gate) * up */
@@ -1210,8 +1261,9 @@ static void single_block_forward(float *hidden, const single_block_t *block,
 
     /* Fused output projection: [attn_out, mlp_out] -> hidden
      * proj_mlp_weight: [hidden, hidden + mlp_hidden]
+     * Use pre-allocated concat buffer
      */
-    float *concat = (float *)malloc(seq * (h_size + mlp_hidden) * sizeof(float));
+    float *concat = tf->single_concat;
     for (int s = 0; s < seq; s++) {
         memcpy(concat + s * (h_size + mlp_hidden),
                attn_out + s * h_size, h_size * sizeof(float));
@@ -1223,19 +1275,10 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     LINEAR_BF16_OR_F32(proj_out, concat, block->proj_mlp_weight, block->proj_mlp_weight_bf16,
                        seq, h_size + mlp_hidden, h_size);
 
-    /* Apply gate and add residual */
-    for (int i = 0; i < seq * h_size; i++) {
-        hidden[i] += gate[i % h_size] * proj_out[i];
-    }
+    /* Apply gate and add residual - use vectorized helper */
+    gated_add(hidden, gate, proj_out, seq, h_size);
 
-    free(mod_params);
-    free(attn_out);
-    free(concat);
-    free(q);
-    free(k);
-    free(v);
-    free(mlp_gate_split);
-    free(mlp_up_split);
+    /* No free - using pre-allocated buffers */
 }
 
 /* ========================================================================
@@ -1323,6 +1366,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 #endif
 
     /* Double-stream blocks */
+    double double_start = tf_get_time_ms();
     for (int i = 0; i < tf->num_double_layers; i++) {
         double_block_forward(img_hidden, txt_hidden,
                              &tf->double_blocks[i],
@@ -1352,6 +1396,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 #endif
     }
 
+    double double_time = tf_get_time_ms() - double_start;
+
     /* Concatenate text and image for single-stream blocks
      * Python uses [txt, img] order for concatenation
      */
@@ -1362,6 +1408,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
            img_seq * hidden * sizeof(float));
 
     /* Single-stream blocks */
+    double single_start = tf_get_time_ms();
     for (int i = 0; i < tf->num_single_layers; i++) {
         single_block_forward(concat_hidden, &tf->single_blocks[i],
                              t_emb, tf->adaln_single_weight,
@@ -1381,6 +1428,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
         }
 #endif
     }
+    double single_time = tf_get_time_ms() - single_start;
 
     /* Extract image hidden states (image is after text) */
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
@@ -1396,6 +1444,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * norm_out.linear.weight is [6144, 3072] = [shift, scale] projection
      * Apply SiLU to t_emb before modulation projection (FLUX architecture)
      */
+    double final_start = tf_get_time_ms();
     float *t_emb_silu = (float *)malloc(hidden * sizeof(float));
     for (int i = 0; i < hidden; i++) {
         float x = t_emb[i];
@@ -1435,6 +1484,14 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     free(img_rope_sin);
     free(txt_rope_cos);
     free(txt_rope_sin);
+
+    double final_time = tf_get_time_ms() - final_start;
+
+    /* Update global timing counters */
+    flux_timing_transformer_double += double_time;
+    flux_timing_transformer_single += single_time;
+    flux_timing_transformer_final += final_time;
+    flux_timing_transformer_total += double_time + single_time + final_time;
 
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
@@ -1629,6 +1686,26 @@ void flux_transformer_free(flux_transformer_t *tf) {
     free(tf->attn_scores);
     free(tf->attn_cat_k);
     free(tf->attn_cat_v);
+
+    /* Free single-block work buffers */
+    free(tf->single_q);
+    free(tf->single_k);
+    free(tf->single_v);
+    free(tf->single_mlp_gate);
+    free(tf->single_mlp_up);
+    free(tf->single_attn_out);
+    free(tf->single_concat);
+
+    /* Free FFN work buffers */
+    free(tf->ffn_gate);
+    free(tf->ffn_up);
+
+    /* Free double-block work buffers */
+    free(tf->t_emb_silu);
+    free(tf->double_mod_img);
+    free(tf->double_mod_txt);
+    free(tf->double_img_attn_out);
+    free(tf->double_txt_attn_out);
 
     free(tf);
 }
@@ -1884,9 +1961,34 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     tf->attn_cat_k = malloc(max_seq * hidden * sizeof(float));
     tf->attn_cat_v = malloc(max_seq * hidden * sizeof(float));
 
+    /* Single-block work buffers (pre-allocated to avoid malloc in hot path) */
+    tf->single_q = malloc(max_seq * hidden * sizeof(float));
+    tf->single_k = malloc(max_seq * hidden * sizeof(float));
+    tf->single_v = malloc(max_seq * hidden * sizeof(float));
+    tf->single_mlp_gate = malloc((size_t)max_seq * mlp * sizeof(float));
+    tf->single_mlp_up = malloc((size_t)max_seq * mlp * sizeof(float));
+    tf->single_attn_out = malloc(max_seq * hidden * sizeof(float));
+    tf->single_concat = malloc((size_t)max_seq * (hidden + mlp) * sizeof(float));
+
+    /* FFN work buffers (shared by double and single blocks) */
+    tf->ffn_gate = malloc((size_t)max_seq * mlp * sizeof(float));
+    tf->ffn_up = malloc((size_t)max_seq * mlp * sizeof(float));
+
+    /* Double-block work buffers */
+    tf->t_emb_silu = malloc(hidden * sizeof(float));
+    tf->double_mod_img = malloc(hidden * 6 * sizeof(float));
+    tf->double_mod_txt = malloc(hidden * 6 * sizeof(float));
+    tf->double_img_attn_out = malloc(max_seq * hidden * sizeof(float));
+    tf->double_txt_attn_out = malloc(max_seq * hidden * sizeof(float));
+
     if (!tf->img_hidden || !tf->txt_hidden || !tf->work1 || !tf->work2 ||
         !tf->attn_q_t || !tf->attn_k_t || !tf->attn_v_t || !tf->attn_out_t ||
-        !tf->attn_scores || !tf->attn_cat_k || !tf->attn_cat_v) {
+        !tf->attn_scores || !tf->attn_cat_k || !tf->attn_cat_v ||
+        !tf->single_q || !tf->single_k || !tf->single_v ||
+        !tf->single_mlp_gate || !tf->single_mlp_up || !tf->single_attn_out ||
+        !tf->single_concat || !tf->ffn_gate || !tf->ffn_up ||
+        !tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt ||
+        !tf->double_img_attn_out || !tf->double_txt_attn_out) {
         flux_transformer_free(tf);
         return NULL;
     }

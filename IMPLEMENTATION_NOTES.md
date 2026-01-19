@@ -188,23 +188,34 @@ Output: updated hidden states
 
 ## Performance Optimizations
 
-### Current Performance (2024-01-19)
+### Current Performance (2026-01-19)
 
 **Benchmark: 256×256, 4 steps, Apple M3 Max**
 
 | Component | Time | Notes |
 |-----------|------|-------|
-| Model loading | ~5.2s | Disk I/O + weight caching |
-| Text encoding | ~3.1s | GPU causal attention |
-| Denoising | ~11-12s | GPU attention, GPU softmax |
+| Model loading | ~5.0s | Disk I/O + weight caching |
+| Text encoding | ~3.0s | GPU causal attention |
+| Denoising | ~7.4s | GPU attention, GPU softmax |
 | VAE decode | ~2.0s | CPU BLAS |
-| **Total** | ~24s | |
+| **Total** | ~17s | Wall clock (overlapping GPU/CPU) |
+
+**Denoising Breakdown (per step after warmup):**
+
+| Component | Time | % |
+|-----------|------|---|
+| Single blocks (20) | ~500ms | 67% |
+| Double blocks (5) | ~250ms | 32% |
+| Final layer | ~3ms | <1% |
+| **Per step total** | ~750ms | |
+
+Note: Step 1 has ~5s GPU warmup overhead (buffer allocation, shader compilation).
 
 **Comparison with PyTorch (bf16, MPS):**
 
 | Size | C Implementation | PyTorch | Gap |
 |------|-----------------|---------|-----|
-| 256×256 | ~24s | ~3s | 8x |
+| 256×256 | ~17s | ~3s | 5.7x |
 | 512×512 | ~50s | ~5.4s | 9x |
 
 ### Optimization History
@@ -247,7 +258,7 @@ Output: updated hidden states
 - K still needs transpose (different layout requirement)
 - **Impact: Text encoding 4.1s → 3.9s**
 
-#### 8. Fused GPU Causal Attention (Latest)
+#### 8. Fused GPU Causal Attention
 - New Metal kernel: `causal_attention_fused`
 - Processes all 32 heads in parallel on GPU
 - Supports GQA (32 Q heads / 8 KV heads)
@@ -255,7 +266,29 @@ Output: updated hidden states
 - Uses threadgroup shared memory for scores
 - **Impact: Text encoding 3.9s → 3.1s (21% faster)**
 
-**Correctness**: Max pixel diff = 1, mean = 0.003 (identical to CPU)
+#### 9. Pre-allocated Transformer Work Buffers
+- Moved all per-block mallocs in transformer to struct:
+  - Single block: q/k/v, mlp_gate/mlp_up, attn_out, concat buffers
+  - Double block: t_emb_silu, mod_img/mod_txt, attn_out buffers
+  - FFN: gate/up work buffers
+- Eliminated ~130MB allocation churn per single block call
+- 80 calls per 256×256 generation = 10.4GB allocation saved
+- **Impact: Total time 24s → 22.4s (7% faster)**
+
+#### 10. Fused Non-Causal Attention Kernel (Latest)
+- New Metal kernel: `attention_fused`
+- Operates directly on [seq, hidden] layout without CPU transpose
+- Used in both self-attention (single blocks) and joint attention (double blocks)
+- Falls back to MPS-based attention for seq_k > 1024
+- **Impact: Minimal (~1% improvement)**
+
+**Why minimal improvement:**
+- Attention is only ~5% of single block compute
+- Linear projections dominate: QKV+MLP = 768×3072×27648 ≈ 65M FLOPs
+- Attention: 768²×128×24×2 ≈ 3.6M FLOPs (18x smaller)
+- The transpose overhead saved (~4ms per step) is small compared to total
+
+**Correctness**: Max pixel diff = 1, mean = 0.008 (identical to reference)
 
 ### GPU Infrastructure
 
@@ -281,10 +314,21 @@ Output: updated hidden states
 
 ### Remaining Optimization Opportunities
 
-1. **VAE Decoder on GPU**: Currently CPU-only, ~2s overhead
-2. **bf16 Inference**: Keep weights in bf16, compute in f16 for 2x bandwidth
-3. **Flash Attention**: Tiled attention for O(n) memory instead of O(n²)
-4. **Fused Kernels**: Combine RMSNorm + linear, reduce sync points
+**Key insight**: Linear projections account for ~95% of single block compute. Attention is only ~5%. The main bottleneck is memory bandwidth from CPU↔GPU copies for each matmul.
+
+**High-impact optimizations:**
+
+1. **Persistent GPU activations**: Keep intermediate tensors on GPU throughout a transformer block instead of copying back to CPU after each matmul. Would eliminate ~80% of memory copies.
+
+2. **Fused linear kernels**: Combine sequences like linear → activation → linear into single GPU operations to reduce sync points.
+
+3. **bf16 compute pipeline**: Use half precision throughout instead of converting bf16 weights to f32 for compute. Would double effective memory bandwidth.
+
+**Lower-impact optimizations:**
+
+4. **VAE Decoder on GPU**: Currently CPU-only, ~2s overhead
+5. **Flash Attention**: Tiled attention for O(n) memory instead of O(n²)
+6. **First-step warmup**: GPU shader compilation adds ~5s to first step
 
 ---
 
@@ -318,12 +362,19 @@ void flux_gpu_sync(void);
 ### GPU Attention APIs
 
 ```c
-// Transformer attention (batched heads, GPU softmax)
+// Transformer attention (batched heads, GPU softmax) - requires transpose
 void flux_metal_attention(float *out,
                           const float *Q, const float *K, const float *V,
                           float *scores_scratch,
                           int heads, int seq_q, int seq_k, int head_dim,
                           float scale);
+
+// Fused transformer attention (no transpose needed) - NEW
+// Works directly on [seq, hidden] layout
+int flux_metal_attention_fused(float *out,
+                               const float *Q, const float *K, const float *V,
+                               int seq_q, int seq_k, int num_heads, int head_dim,
+                               float scale);
 
 // Text encoder causal attention (fused kernel, all heads parallel)
 int flux_metal_causal_attention(float *out,

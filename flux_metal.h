@@ -258,6 +258,20 @@ int flux_metal_causal_attention(float *out,
                                  int seq, int num_q_heads, int num_kv_heads,
                                  int head_dim, float scale);
 
+/*
+ * Fused non-causal attention for transformer.
+ * Works directly on [seq, hidden] layout without transpose.
+ * Supports different Q and K/V sequence lengths (for joint attention).
+ *
+ * This does: out = softmax(Q @ K^T * scale) @ V
+ * All operations are fused in a single GPU kernel.
+ * Returns 1 on success, 0 on failure (falls back to CPU).
+ */
+int flux_metal_attention_fused(float *out,
+                               const float *Q, const float *K, const float *V,
+                               int seq_q, int seq_k, int num_heads, int head_dim,
+                               float scale);
+
 /* ========================================================================
  * GPU Compute Shaders - Element-wise operations on GPU
  * ======================================================================== */

@@ -1335,6 +1335,7 @@ static id<MTLComputePipelineState> g_silu_mul_pipeline = nil;
 static id<MTLComputePipelineState> g_softmax_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_2d_pipeline = nil;
 static id<MTLComputePipelineState> g_causal_attention_pipeline = nil;
+static id<MTLComputePipelineState> g_attention_fused_pipeline = nil;
 static int g_shaders_initialized = 0;
 
 int flux_metal_shaders_available(void) {
@@ -1478,6 +1479,15 @@ int flux_metal_init_shaders(void) {
             g_causal_attention_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_causal_attention_pipeline) {
                 fprintf(stderr, "Metal shaders: causal_attention_fused pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"attention_fused"];
+        if (func) {
+            g_attention_fused_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_attention_fused_pipeline) {
+                fprintf(stderr, "Metal shaders: attention_fused pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -1946,6 +1956,88 @@ int flux_metal_causal_attention(float *out,
         pool_release_buffer(bufV);
         pool_release_buffer(bufOut);
         if (bufMask) pool_release_buffer(bufMask);
+
+        return 1;  /* Success */
+    }
+}
+
+/* Fused non-causal attention for transformer
+ * Works directly on [seq, hidden] layout without transpose.
+ * Returns 1 on success, 0 to fall back to CPU.
+ */
+int flux_metal_attention_fused(float *out,
+                               const float *Q, const float *K, const float *V,
+                               int seq_q, int seq_k, int num_heads, int head_dim,
+                               float scale) {
+    if (!g_shaders_initialized || !g_attention_fused_pipeline) {
+        return 0;  /* Shader not available, fall back to CPU */
+    }
+
+    /* Limit seq_k length to what the shader can handle (1024 for shared memory) */
+    if (seq_k > 1024) {
+        return 0;  /* Fall back to CPU for long sequences */
+    }
+
+    @autoreleasepool {
+        int hidden = num_heads * head_dim;
+        size_t q_size = (size_t)seq_q * hidden * sizeof(float);
+        size_t kv_size = (size_t)seq_k * hidden * sizeof(float);
+        size_t out_size = q_size;
+
+        /* Create GPU buffers */
+        id<MTLBuffer> bufQ = pool_get_buffer(q_size);
+        id<MTLBuffer> bufK = pool_get_buffer(kv_size);
+        id<MTLBuffer> bufV = pool_get_buffer(kv_size);
+        id<MTLBuffer> bufOut = pool_get_buffer(out_size);
+
+        if (!bufQ || !bufK || !bufV || !bufOut) {
+            if (bufQ) pool_release_buffer(bufQ);
+            if (bufK) pool_release_buffer(bufK);
+            if (bufV) pool_release_buffer(bufV);
+            if (bufOut) pool_release_buffer(bufOut);
+            return 0;
+        }
+
+        /* Copy input data */
+        memcpy([bufQ contents], Q, q_size);
+        memcpy([bufK contents], K, kv_size);
+        memcpy([bufV contents], V, kv_size);
+
+        /* Create command buffer and encode kernel */
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_attention_fused_pipeline];
+        [encoder setBuffer:bufQ offset:0 atIndex:0];
+        [encoder setBuffer:bufK offset:0 atIndex:1];
+        [encoder setBuffer:bufV offset:0 atIndex:2];
+        [encoder setBuffer:bufOut offset:0 atIndex:3];
+        [encoder setBytes:&seq_q length:sizeof(int) atIndex:4];
+        [encoder setBytes:&seq_k length:sizeof(int) atIndex:5];
+        [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+        [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+
+        /* Dispatch: one threadgroup per (query_pos, head) pair
+         * Each threadgroup has threads for parallel reduction (softmax) */
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+
+        /* Execute and wait */
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        /* Copy output back to CPU */
+        memcpy(out, [bufOut contents], out_size);
+
+        /* Release buffers */
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufV);
+        pool_release_buffer(bufOut);
 
         return 1;  /* Success */
     }
