@@ -1,6 +1,6 @@
 # FLUX.2-klein-4B Pure C Implementation
 
-This program generates images from text prompts (and optionally from other images) using the FLUX.2-klein-4B model from Black Forest Labs. It can be used as a library as well, and is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended.
+This program generates images from text prompts (and optionally from other images) using the [FLUX.2-klein-4B model](https://bfl.ai/models/flux-2-klein) from [Black Forest Labs](https://bfl.ai/). It can be used as a library as well, and is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended.
 
 ## Quick Start
 
