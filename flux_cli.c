@@ -700,7 +700,14 @@ static int process_prompt(char *line) {
     }
 
     if (!*line) {
-        fprintf(stderr, "Error: Empty prompt.\n");
+        /* If only size was provided, set it as new default */
+        if (explicit_w > 0 && explicit_h > 0) {
+            state.width = explicit_w;
+            state.height = explicit_h;
+            printf("Default size: %dx%d\n", state.width, state.height);
+        } else {
+            fprintf(stderr, "Error: Empty prompt.\n");
+        }
         free(prompt_to_free);
         return 0;
     }
