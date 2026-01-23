@@ -29,6 +29,7 @@
 #define CLI_DEFAULT_WIDTH 256
 #define CLI_DEFAULT_HEIGHT 256
 #define CLI_DEFAULT_STEPS 4
+#define CLI_MAX_REFS 100  /* Circular buffer size for $N references */
 
 /* ======================================================================
  * Terminal Detection
@@ -43,6 +44,12 @@ static int has_kitty_graphics(void) {
  * Session State
  * ====================================================================== */
 
+/* Reference tracking for $N syntax */
+typedef struct {
+    int id;                      /* The $N number */
+    char path[CLI_MAX_PATH];     /* Path to image file */
+} cli_ref;
+
 typedef struct {
     flux_ctx *ctx;
     char model_dir[CLI_MAX_PATH];
@@ -55,9 +62,36 @@ typedef struct {
     int image_count;
     int show_enabled;
     int open_enabled;
+    /* Reference tracking */
+    cli_ref refs[CLI_MAX_REFS];  /* Circular buffer of references */
+    int next_ref_id;             /* Next $N to assign */
 } cli_state;
 
 static cli_state state;
+
+/* ======================================================================
+ * Reference Management ($N syntax)
+ * ====================================================================== */
+
+/* Register a new image and return its $N id */
+static int ref_add(const char *path) {
+    int id = state.next_ref_id++;
+    int slot = id % CLI_MAX_REFS;
+    state.refs[slot].id = id;
+    strncpy(state.refs[slot].path, path, CLI_MAX_PATH - 1);
+    state.refs[slot].path[CLI_MAX_PATH - 1] = '\0';
+    return id;
+}
+
+/* Lookup a reference by $N id. Returns path or NULL if not found. */
+static const char *ref_lookup(int id) {
+    if (id < 0 || id >= state.next_ref_id) return NULL;
+    /* Check if id is still in the circular buffer */
+    if (state.next_ref_id - id > CLI_MAX_REFS) return NULL;
+    int slot = id % CLI_MAX_REFS;
+    if (state.refs[slot].id != id) return NULL;
+    return state.refs[slot].path;
+}
 
 /* ======================================================================
  * Utility Functions
@@ -243,10 +277,72 @@ static int generate_image(const char *prompt, const char *ref_image) {
     flux_image_save_with_seed(img, path, actual_seed);
     flux_image_free(img);
 
-    /* Update last image */
+    /* Update last image and register as reference */
     strncpy(state.last_image, path, sizeof(state.last_image) - 1);
+    int ref_id = ref_add(path);
 
-    printf("Done -> %s\n", path);
+    printf("Done -> %s (ref $%d)\n", path, ref_id);
+    display_image(path);
+
+    return 0;
+}
+
+static int generate_multiref(const char *prompt, const char **ref_paths, int num_refs) {
+    flux_params params = FLUX_PARAMS_DEFAULT;
+    params.width = state.width;
+    params.height = state.height;
+    params.num_steps = state.steps;
+
+    /* Determine seed */
+    int64_t actual_seed;
+    if (state.seed >= 0) {
+        actual_seed = state.seed;
+    } else {
+        actual_seed = (int64_t)time(NULL) ^ (int64_t)rand();
+    }
+    params.seed = actual_seed;
+    printf("Seed: %lld\n", (long long)actual_seed);
+
+    /* Load reference images */
+    flux_image **refs = (flux_image **)malloc(num_refs * sizeof(flux_image *));
+    for (int i = 0; i < num_refs; i++) {
+        refs[i] = flux_image_load(ref_paths[i]);
+        if (!refs[i]) {
+            fprintf(stderr, "Error: Cannot load '%s'\n", ref_paths[i]);
+            for (int j = 0; j < i; j++) flux_image_free(refs[j]);
+            free(refs);
+            return -1;
+        }
+    }
+
+    printf("Generating %dx%d (multi-ref, %d images)...\n",
+           params.width, params.height, num_refs);
+
+    flux_image *img = flux_multiref(state.ctx, prompt,
+                                     (const flux_image **)refs, num_refs, &params);
+
+    /* Free reference images */
+    for (int i = 0; i < num_refs; i++) {
+        flux_image_free(refs[i]);
+    }
+    free(refs);
+
+    if (!img) {
+        fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
+        return -1;
+    }
+
+    /* Save to temp */
+    char path[CLI_MAX_PATH];
+    get_image_path(path, sizeof(path));
+    flux_image_save_with_seed(img, path, actual_seed);
+    flux_image_free(img);
+
+    /* Update last image and register as reference */
+    strncpy(state.last_image, path, sizeof(state.last_image) - 1);
+    int ref_id = ref_add(path);
+
+    printf("Done -> %s (ref $%d)\n", path, ref_id);
     display_image(path);
 
     return 0;
@@ -274,6 +370,10 @@ static void cmd_help(void) {
     printf("  <prompt>              Generate image from prompt\n");
     printf("  512x512 <prompt>      Set size inline\n");
     printf("  $ <prompt>            Img2img using last/loaded image\n");
+    printf("  $N <prompt>           Img2img using reference $N\n");
+    printf("  $1 $3 <prompt>        Multi-reference (combine images)\n");
+    printf("\n");
+    printf("Each generated/loaded image gets a $N reference ID.\n");
     printf("\n");
 }
 
@@ -328,12 +428,13 @@ static void cmd_load(char *arg) {
     get_image_path(path, sizeof(path));
     flux_image_save(img, path);
 
-    /* Update state */
+    /* Update state and register as reference */
     strncpy(state.last_image, path, sizeof(state.last_image) - 1);
+    int ref_id = ref_add(path);
     state.width = img->width;
     state.height = img->height;
 
-    printf("Loaded: %s (%dx%d)\n", arg, img->width, img->height);
+    printf("Loaded: %s (%dx%d, ref $%d)\n", arg, img->width, img->height, ref_id);
     flux_image_free(img);
 }
 
@@ -531,18 +632,36 @@ static int process_prompt(char *line) {
     line = skip_spaces(line);
     if (!*line) return 0;
 
-    char *ref_image = NULL;
     char *prompt_to_free = NULL;
 
-    /* Check for $ prefix (img2img) */
-    if (*line == '$') {
-        line = skip_spaces(line + 1);
-        if (state.last_image[0] == '\0') {
-            fprintf(stderr, "Error: No image for img2img. "
-                            "Generate or !load an image first.\n");
-            return 0;
+    /* Parse $N references at the beginning */
+    const char *ref_paths[CLI_MAX_REFS];
+    int num_refs = 0;
+
+    while (*line == '$') {
+        line++;  /* skip $ */
+        char *end;
+        long id = strtol(line, &end, 10);
+        if (end == line) {
+            /* Just $ without number - use last image */
+            if (state.last_image[0] == '\0') {
+                fprintf(stderr, "Error: No image for img2img. "
+                                "Generate or !load an image first.\n");
+                return 0;
+            }
+            ref_paths[num_refs++] = state.last_image;
+        } else {
+            /* $N - lookup reference */
+            const char *path = ref_lookup((int)id);
+            if (!path) {
+                fprintf(stderr, "Error: Reference $%ld not found.\n", id);
+                return 0;
+            }
+            ref_paths[num_refs++] = path;
+            line = end;
         }
-        ref_image = state.last_image;
+        line = skip_spaces(line);
+        if (num_refs >= CLI_MAX_REFS) break;
     }
 
     /* Check for inline size (beginning or end of prompt) */
@@ -562,7 +681,16 @@ static int process_prompt(char *line) {
         return 0;
     }
 
-    generate_image(line, ref_image);
+    /* Generate based on number of references */
+    if (num_refs == 0) {
+        generate_image(line, NULL);
+    } else if (num_refs == 1) {
+        generate_image(line, ref_paths[0]);
+    } else {
+        /* Multi-reference generation */
+        generate_multiref(line, ref_paths, num_refs);
+    }
+
     free(prompt_to_free);
     return 0;
 }
