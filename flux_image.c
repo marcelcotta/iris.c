@@ -1030,7 +1030,7 @@ static int jpeg_extend(int v, int bits) {
     if (bits == 0) return 0;
     int vt = 1 << (bits - 1);
     if (v < vt) {
-        v = v + (-1 << bits) + 1;
+        v = v - (1 << bits) + 1;
     }
     return v;
 }

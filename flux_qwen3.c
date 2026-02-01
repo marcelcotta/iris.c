@@ -125,10 +125,12 @@ struct qwen3_model {
 /* Forward declarations for mmap streaming mode */
 static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx);
+#ifdef USE_METAL
 static int load_layer_weights_small_f32(qwen3_layer_t *layer, safetensors_file_t **files,
                                         int num_files, int layer_idx);
 static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **files,
                                    int num_files, int layer_idx);
+#endif
 static void free_layer_weights(qwen3_layer_t *layer);
 
 /* ========================================================================
@@ -918,6 +920,7 @@ static float *load_tensor(safetensors_file_t **files, int num_files, const char 
     return NULL;
 }
 
+#ifdef USE_METAL
 /* Helper to load bf16 tensor directly (zero-copy from mmap region) */
 static uint16_t *load_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
     for (int f = 0; f < num_files; f++) {
@@ -952,6 +955,7 @@ static int load_layer_weights_small_f32(qwen3_layer_t *layer, safetensors_file_t
     return (layer->input_layernorm_weight && layer->post_attention_layernorm_weight &&
             layer->attn.q_norm_weight && layer->attn.k_norm_weight) ? 0 : -1;
 }
+#endif
 
 static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx) {
@@ -1008,6 +1012,7 @@ static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
     return 0;
 }
 
+#ifdef USE_METAL
 /* Load bf16 weights for a layer (GPU acceleration path).
  * Returns 1 if all bf16 weights loaded successfully, 0 otherwise.
  * bf16 pointers are direct into mmap region - do NOT free them. */
@@ -1051,6 +1056,7 @@ static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **fi
             layer->mlp.gate_proj_weight_bf16 && layer->mlp.up_proj_weight_bf16 &&
             layer->mlp.down_proj_weight_bf16);
 }
+#endif
 
 /* Free a single layer's weights (used in mmap streaming mode) */
 static void free_layer_weights(qwen3_layer_t *layer) {
