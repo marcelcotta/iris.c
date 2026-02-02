@@ -2604,6 +2604,76 @@ flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
     }
 }
 
+/* GPU linear with bf16 weights - writes to pre-allocated output tensor.
+ * Same as flux_gpu_linear_bf16 but avoids allocation overhead by reusing buffers. */
+int flux_gpu_linear_bf16_into(flux_gpu_tensor_t out,
+                              flux_gpu_tensor_t x,
+                              const uint16_t *W_bf16,
+                              int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !out || !x || !W_bf16) return 0;
+
+    @autoreleasepool {
+        /* Verify output buffer is large enough */
+        size_t out_elements = (size_t)seq_len * out_dim;
+        if (out->num_elements < out_elements) return 0;
+
+        /* Get cached f16 weight buffer (bf16 converted to f16) */
+        size_t numW = (size_t)out_dim * in_dim;
+        id<MTLBuffer> bufW = get_cached_bf16_as_f16_buffer(W_bf16, numW);
+        if (!bufW) return 0;
+
+        /* Create matrix descriptors */
+        MPSMatrixDescriptor *descX = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:in_dim
+                            rowBytes:in_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:out_dim columns:in_dim
+                            rowBytes:in_dim * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:out_dim
+                            rowBytes:out_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+
+        MPSMatrix *matX = [[MPSMatrix alloc] initWithBuffer:x->buffer descriptor:descX];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer descriptor:descOut];
+
+        /* Create matmul: out = x @ W^T */
+        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
+            initWithDevice:g_device
+               transposeLeft:NO
+              transposeRight:YES
+                  resultRows:seq_len
+               resultColumns:out_dim
+             interiorColumns:in_dim
+                       alpha:1.0f
+                        beta:0.0f];
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        [matmul encodeToCommandBuffer:cmdBuffer
+                           leftMatrix:matX
+                          rightMatrix:matW
+                         resultMatrix:matOut];
+
+        /* Mark tensors as having pending work */
+        out->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+        }
+
+        if (g_tensor_batch_mode) {
+            x->has_pending_work = 1;
+        }
+
+        return 1;
+    }
+}
+
 /* GPU linear with bf16 weights - outputs bf16 tensor for full bf16 pipeline
  * Uses native bf16 (MPSDataTypeBFloat16). */
 flux_gpu_tensor_t flux_gpu_linear_bf16_bf16out(flux_gpu_tensor_t x,
