@@ -29,18 +29,18 @@
 
 ### 256x256 (seq=256+512=768 tokens)
 - Text encoding: 1.0s (Qwen3, GPU-resident forward, was 1.9s)
-- Denoising total: 2073 ms (4 steps)
-  - Step 1: ~570 ms, Steps 2-4: ~500 ms each
-- VAE decode: 0.4s
+- Denoising total: 2089 ms (4 steps)
+  - Step 1: ~582 ms, Steps 2-4: ~500 ms each
+- VAE decode: 0.2s (GPU-resident, was 0.4s)
 - Transformer loading: 1.3s (includes bf16 weight cache warmup)
-- **Total: ~5.4s**
+- **Total: ~5.2s**
 
 ### 512x512 (seq=1024+512=1536 tokens)
 - Text encoding: 1.0s
-- Denoising total: 4004 ms (4 steps)
-  - Step 1: ~1058 ms, Steps 2-4: ~980 ms each
-- VAE decode: 1.6s
-- **Total: ~8.6s**
+- Denoising total: 4050 ms (4 steps)
+  - Step 1: ~1081 ms, Steps 2-4: ~987 ms each
+- VAE decode: 0.5s (GPU-resident, was 1.6s)
+- **Total: ~7.5s**
 
 ### Key observations
 - Monolithic GPU batch: 1 command buffer per step (all 25 blocks + concat + slice + final)
@@ -55,6 +55,8 @@
 - Pre-warm bf16->f16 weight cache
 - Persistent GPU tensors
 - SwiGLU fused on GPU
+- GPU-resident Qwen3 text encoder (1 sync for 27 layers)
+- GPU-resident VAE decoder (f32 group_norm/swish/add/upsample on GPU)
 
 ## Optimization Attempts
 
@@ -130,11 +132,36 @@
 - **Result: text encoding 1.9s → 1.0s (47% faster)**
 - End-to-end: 256x256 5.9s → 5.4s, 512x512 9.1s → 8.6s
 
-### Next targets — beyond transformer denoising
-- **Text encoder (Qwen3)**: now 1.0s (was 1.9s) — 1.0s remaining is mostly GPU compute
-  - Theoretical minimum ~430ms (1.94 TFLOPS, assuming 4.5 TFLOPS achieved throughput)
-  - Look at `./mlx/mlx/backend/metal/` for Apple Metal kernel insights (JITs, tiling strategies)
-- **VAE decoder**: 0.4s (256x256), 1.6s (512x512) — scales with resolution
+### Attempt 5b: Pre-warm Qwen3 bf16 buffer cache (FAILED)
+- Tried loading all 27 layers' bf16 weights into Metal buffer cache before GPU encoding
+- Pre-warm loop: load_layer_weights_bf16 + flux_metal_warmup_bf16_buffer for 7 weights/layer (189 total, ~5.4GB)
+- Without pre-warming: encode=874ms (includes cache fills), GPU exec overlaps → total 1.0s
+- With pre-warming: pre-warm=770ms + encode=114ms + GPU exec=315ms → total 1.2s (20% slower!)
+- **Root cause**: MPS commit-and-continue pipelines GPU execution during encoding. When cache fills are
+  interleaved with matmul encoding, the GPU starts executing early layers while later layers are still
+  being cached. Pre-warming eliminates this overlap, making things slower.
+- **Key insight**: For one-shot text encoding, the natural interleaving of cache fills + GPU encoding
+  provides better pipelining than a separate pre-warm pass. Pre-warming only helps for repeated calls.
+
+### Attempt 6: GPU-resident VAE decoder (SUCCESS)
+- Previous: each conv2d allocates Metal buffers (copies ~128MB in), runs conv, copies back, syncs
+- At 512x512 with 128ch, each of ~30 conv2d calls does a full CPU↔GPU round-trip
+- Profiling showed time distribution: up[0] 697ms (512x512), up[1] 486ms, up[2] 203ms, rest 214ms
+- New: keep all data on GPU in `flux_gpu_tensor_t` handles within batch_begin/batch_end
+- Added 4 new f32 Metal shaders: group_norm_f32, swish_f32, add_f32, upsample_nearest_2x_f32
+- Added `flux_gpu_conv2d_f32()` using MPSGraph within the tensor batch system
+- Resblocks use GPU tensors: group_norm → swish → conv2d → group_norm → swish → conv2d → add (all GPU)
+- Mid-block attention still runs on CPU (sync down, CPU attention, sync up) — only 53ms at 512x512
+- Two batch_begin/batch_end calls: before and after mid-block attention
+- Falls back to CPU path automatically if GPU operations fail
+- **Result: 256x256 VAE 0.4s → 0.2s (50% faster), 512x512 VAE 1.6s → 0.5s (69% faster)**
+- **End-to-end: 256x256 5.4s → 5.2s, 512x512 8.6s → 7.5s (13% faster)**
+
+### Next targets
+- **Text encoder (Qwen3)**: now 1.0s — theoretical ~430ms. Bottleneck is cache fill + GPU overlap.
+- **VAE decoder**: now 0.2s/0.5s — mid-block attention still on CPU (~50ms at 512x512)
+  - Could move attention to GPU for small additional gain
+- **Transformer loading**: 1.3s — could overlap with text encoding on high-memory systems
 - **1024x1024 generation**: different dynamics — img_seq = 4096 tokens, attention-heavy
   - Attention becomes larger fraction of compute (O(n^2) scaling)
   - Custom fused attention kernel may help at larger seq lengths

@@ -440,11 +440,264 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
 }
 
 /* ========================================================================
+ * GPU-Resident Decoder
+ * ======================================================================== */
+
+#ifdef USE_METAL
+
+/* GPU resblock: all operations on GPU, returns new tensor */
+static flux_gpu_tensor_t resblock_forward_gpu(flux_gpu_tensor_t x,
+                                               const vae_resblock_t *block,
+                                               int batch, int H, int W,
+                                               int num_groups, float eps) {
+    int in_ch = block->in_channels;
+    int out_ch = block->out_channels;
+    int spatial = H * W;
+    int n = batch * out_ch * spatial;
+
+    /* Skip connection */
+    flux_gpu_tensor_t skip;
+    if (in_ch != out_ch) {
+        skip = flux_gpu_conv2d_f32(x, block->skip_weight, block->skip_bias,
+                                    batch, in_ch, out_ch, H, W, 1, 1, 1, 0);
+    } else {
+        skip = flux_gpu_tensor_alloc((size_t)n);
+        flux_gpu_copy_f32(skip, x, (size_t)n);
+    }
+    if (!skip) return NULL;
+
+    /* Main path: norm1 -> swish -> conv1 -> norm2 -> swish -> conv2 */
+    flux_gpu_tensor_t work = flux_gpu_tensor_alloc((size_t)batch * in_ch * spatial);
+    if (!work) { flux_gpu_tensor_free(skip); return NULL; }
+
+    flux_gpu_group_norm_f32(work, x, block->norm1_weight, block->norm1_bias,
+                             batch, in_ch, spatial, num_groups, eps);
+    flux_gpu_swish_f32(work, work, batch * in_ch * spatial);
+
+    flux_gpu_tensor_t conv1_out = flux_gpu_conv2d_f32(work, block->conv1_weight, block->conv1_bias,
+                                                       batch, in_ch, out_ch, H, W, 3, 3, 1, 1);
+    flux_gpu_tensor_free(work);
+    if (!conv1_out) { flux_gpu_tensor_free(skip); return NULL; }
+
+    work = flux_gpu_tensor_alloc((size_t)batch * out_ch * spatial);
+    if (!work) { flux_gpu_tensor_free(skip); flux_gpu_tensor_free(conv1_out); return NULL; }
+
+    flux_gpu_group_norm_f32(work, conv1_out, block->norm2_weight, block->norm2_bias,
+                             batch, out_ch, spatial, num_groups, eps);
+    flux_gpu_swish_f32(work, work, batch * out_ch * spatial);
+    flux_gpu_tensor_free(conv1_out);
+
+    conv1_out = flux_gpu_conv2d_f32(work, block->conv2_weight, block->conv2_bias,
+                                     batch, out_ch, out_ch, H, W, 3, 3, 1, 1);
+    flux_gpu_tensor_free(work);
+    if (!conv1_out) { flux_gpu_tensor_free(skip); return NULL; }
+
+    /* Residual: skip += conv_out */
+    flux_gpu_add_f32(skip, skip, conv1_out, n);
+    flux_gpu_tensor_free(conv1_out);
+
+    return skip;
+}
+
+/* GPU-resident VAE decode.
+ * Keeps all data on GPU, only syncs for mid-block attention (CPU) and final output.
+ * Returns NULL on failure (caller falls back to CPU path). */
+static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
+                                   int batch, int latent_h, int latent_w) {
+    if (!flux_metal_available()) return NULL;
+
+    int ch_mult[4] = {1, 2, 4, 4};
+
+    /* Batch denormalize + unpatchify on CPU (small data, fast) */
+    float *cpu_x = vae->work1;
+    float *cpu_work = vae->work2;
+
+    int z_spatial = latent_h * latent_w;
+    flux_copy(cpu_x, latent, batch * FLUX_LATENT_CHANNELS * z_spatial);
+    for (int b = 0; b < batch; b++) {
+        for (int c = 0; c < FLUX_LATENT_CHANNELS; c++) {
+            float mean = vae->bn_mean[c];
+            float std = sqrtf(vae->bn_var[c] + vae->eps);
+            for (int i = 0; i < z_spatial; i++) {
+                int idx = b * FLUX_LATENT_CHANNELS * z_spatial + c * z_spatial + i;
+                cpu_x[idx] = cpu_x[idx] * std + mean;
+            }
+        }
+    }
+
+    int unpatch_h = latent_h * 2;
+    int unpatch_w = latent_w * 2;
+    flux_unpatchify(cpu_work, cpu_x, batch, vae->z_channels, latent_h, latent_w, 2);
+    flux_copy(cpu_x, cpu_work, batch * vae->z_channels * unpatch_h * unpatch_w);
+    int cur_h = unpatch_h, cur_w = unpatch_w;
+
+    /* Upload to GPU and start batch */
+    size_t x_size = (size_t)batch * vae->z_channels * cur_h * cur_w;
+    flux_gpu_tensor_t x = flux_gpu_tensor_create(cpu_x, x_size);
+    if (!x) return NULL;
+
+    flux_gpu_batch_begin();
+
+    /* Post-quantization conv (1x1): 32 -> 32 */
+    flux_gpu_tensor_t t = flux_gpu_conv2d_f32(x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
+                                               batch, vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0);
+    flux_gpu_tensor_free(x);
+    if (!t) { flux_gpu_batch_end(); return NULL; }
+    x = t;
+
+    /* Conv in: 32 -> 512 */
+    int mid_ch = vae->base_channels * ch_mult[3];
+    t = flux_gpu_conv2d_f32(x, vae->dec_conv_in_weight, vae->dec_conv_in_bias,
+                             batch, vae->z_channels, mid_ch, cur_h, cur_w, 3, 3, 1, 1);
+    flux_gpu_tensor_free(x);
+    if (!t) { flux_gpu_batch_end(); return NULL; }
+    x = t;
+
+    /* Mid block: resblock1 */
+    int progress = 0;
+    int total_blocks = 3 + 4 * (vae->num_res_blocks + 1);
+
+    t = resblock_forward_gpu(x, &vae->dec_mid_block1, batch, cur_h, cur_w, vae->num_groups, vae->eps);
+    flux_gpu_tensor_free(x);
+    if (!t) { flux_gpu_batch_end(); return NULL; }
+    x = t;
+    if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+
+    /* Mid block attention: sync to CPU, run attention, upload back */
+    {
+        size_t attn_size = (size_t)batch * mid_ch * cur_h * cur_w;
+        float *cpu_attn_in = cpu_work;
+
+        flux_gpu_batch_end();  /* Sync: execute everything queued so far */
+
+        /* Download GPU tensor to CPU */
+        flux_gpu_tensor_read(x, cpu_attn_in);
+
+        /* Run attention on CPU (uses existing attnblock_forward) */
+        float *cpu_attn_out = cpu_x;
+        if (attnblock_forward(cpu_attn_out, cpu_attn_in, &vae->dec_mid_attn,
+                               vae->work3, batch, cur_h, cur_w,
+                               vae->num_groups, vae->eps) < 0) {
+            flux_gpu_tensor_free(x);
+            return NULL;
+        }
+        if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+
+        /* Upload result back to GPU */
+        flux_gpu_tensor_free(x);
+        x = flux_gpu_tensor_create(cpu_attn_out, attn_size);
+        if (!x) return NULL;
+
+        flux_gpu_batch_begin();  /* Start new batch for remaining work */
+    }
+
+    /* Mid block: resblock2 */
+    t = resblock_forward_gpu(x, &vae->dec_mid_block2, batch, cur_h, cur_w, vae->num_groups, vae->eps);
+    flux_gpu_tensor_free(x);
+    if (!t) { flux_gpu_batch_end(); return NULL; }
+    x = t;
+    if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+
+    int block_idx = 0;
+    int up_idx = 0;
+
+    /* Up blocks (reverse order of channels) */
+    for (int level = 3; level >= 0; level--) {
+        int ch_out = vae->base_channels * ch_mult[level];
+
+        for (int r = 0; r < vae->num_res_blocks + 1; r++) {
+            vae_resblock_t *block = &vae->dec_up_blocks[block_idx++];
+            t = resblock_forward_gpu(x, block, batch, cur_h, cur_w, vae->num_groups, vae->eps);
+            flux_gpu_tensor_free(x);
+            if (!t) { flux_gpu_batch_end(); return NULL; }
+            x = t;
+            if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+        }
+
+        /* Upsample (except level 0) */
+        if (level > 0) {
+            vae_upsample_t *us = &vae->dec_upsample[up_idx++];
+            int new_h = cur_h * 2;
+            int new_w = cur_w * 2;
+
+            t = flux_gpu_upsample_nearest_2x_f32(x, ch_out, cur_h, cur_w);
+            flux_gpu_tensor_free(x);
+            if (!t) { flux_gpu_batch_end(); return NULL; }
+
+            x = flux_gpu_conv2d_f32(t, us->conv_weight, us->conv_bias,
+                                     batch, ch_out, ch_out, new_h, new_w, 3, 3, 1, 1);
+            flux_gpu_tensor_free(t);
+            if (!x) { flux_gpu_batch_end(); return NULL; }
+
+            cur_h = new_h;
+            cur_w = new_w;
+        }
+    }
+
+    /* Output: norm -> swish -> conv_out */
+    int out_ch = vae->base_channels;  /* 128 */
+    size_t final_size = (size_t)batch * out_ch * cur_h * cur_w;
+    t = flux_gpu_tensor_alloc(final_size);
+    if (!t) { flux_gpu_tensor_free(x); flux_gpu_batch_end(); return NULL; }
+    flux_gpu_group_norm_f32(t, x, vae->dec_norm_out_weight, vae->dec_norm_out_bias,
+                             batch, out_ch, cur_h * cur_w, vae->num_groups, vae->eps);
+    flux_gpu_swish_f32(t, t, (int)final_size);
+    flux_gpu_tensor_free(x);
+
+    x = flux_gpu_conv2d_f32(t, vae->dec_conv_out_weight, vae->dec_conv_out_bias,
+                             batch, out_ch, 3, cur_h, cur_w, 3, 3, 1, 1);
+    flux_gpu_tensor_free(t);
+    if (!x) { flux_gpu_batch_end(); return NULL; }
+
+    /* Execute everything and read result */
+    flux_gpu_batch_end();
+
+    int H = cur_h;
+    int W = cur_w;
+    size_t rgb_size = (size_t)batch * 3 * H * W;
+    float *rgb = (float *)malloc(rgb_size * sizeof(float));
+    if (!rgb) { flux_gpu_tensor_free(x); return NULL; }
+    flux_gpu_tensor_read(x, rgb);
+    flux_gpu_tensor_free(x);
+
+    /* Convert to image */
+    flux_image *img = flux_image_create(W, H, 3);
+    if (!img) { free(rgb); return NULL; }
+
+    for (int y = 0; y < H; y++) {
+        for (int c = 0; c < W; c++) {
+            for (int ch = 0; ch < 3; ch++) {
+                float val = rgb[ch * H * W + y * W + c];
+                val = (val + 1.0f) * 0.5f;
+                val = val * 255.0f;
+                if (val < 0) val = 0;
+                if (val > 255) val = 255;
+                img->data[(y * W + c) * 3 + ch] = (unsigned char)(val + 0.5f);
+            }
+        }
+    }
+
+    free(rgb);
+    return img;
+}
+
+#endif /* USE_METAL */
+
+/* ========================================================================
  * Decoder Forward Pass
  * ======================================================================== */
 
 flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
+#ifdef USE_METAL
+    /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
+    if (flux_metal_available()) {
+        flux_image *gpu_result = vae_decode_gpu(vae, latent, batch, latent_h, latent_w);
+        if (gpu_result) return gpu_result;
+        /* Fall through to CPU path on failure */
+    }
+#endif
+
     /*
      * Decoder path:
      * [B, 128, H/16, W/16]

@@ -216,6 +216,11 @@ static id<MTLComputePipelineState> g_slice_seq_bf16_pipeline;
 static id<MTLComputePipelineState> g_transpose_to_heads_bf16_pipeline;
 static id<MTLComputePipelineState> g_transpose_from_heads_bf16_pipeline;
 static id<MTLComputePipelineState> g_attention_fused_bf16_pipeline;
+/* F32 VAE pipelines */
+static id<MTLComputePipelineState> g_group_norm_f32_pipeline;
+static id<MTLComputePipelineState> g_swish_f32_pipeline;
+static id<MTLComputePipelineState> g_add_f32_pipeline;
+static id<MTLComputePipelineState> g_upsample_nearest_2x_f32_pipeline;
 static int g_shaders_initialized;
 
 /* ========================================================================
@@ -3353,6 +3358,24 @@ int flux_metal_init_shaders(void) {
             g_attention_fused_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
 
+        /* F32 VAE shaders */
+        func = [g_shader_library newFunctionWithName:@"group_norm_f32"];
+        if (func) {
+            g_group_norm_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+        func = [g_shader_library newFunctionWithName:@"swish_f32"];
+        if (func) {
+            g_swish_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+        func = [g_shader_library newFunctionWithName:@"add_f32"];
+        if (func) {
+            g_add_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+        func = [g_shader_library newFunctionWithName:@"upsample_nearest_2x_f32"];
+        if (func) {
+            g_upsample_nearest_2x_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
         g_shaders_initialized = 1;
         if (flux_verbose)
             fprintf(stderr, "Metal shaders: compute kernels loaded\n");
@@ -5867,5 +5890,291 @@ int flux_metal_attention_fused(float *out,
 
         return 1;  /* Success */
     }
+}
+
+/* ========================================================================
+ * F32 VAE GPU Operations — Keep data on GPU for the VAE decoder
+ * ======================================================================== */
+
+/* GroupNorm on f32 GPU tensors */
+void flux_gpu_group_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                              const float *gamma, const float *beta,
+                              int batch, int channels, int spatial, int num_groups, float eps) {
+    if (!g_shaders_initialized || !g_group_norm_f32_pipeline) return;
+    if (!out || !x || !gamma || !beta) return;
+
+    @autoreleasepool {
+        size_t gamma_size = (size_t)channels * sizeof(float);
+        id<MTLBuffer> bufGamma = get_cached_weight_buffer(gamma, gamma_size);
+        id<MTLBuffer> bufBeta = get_cached_weight_buffer(beta, gamma_size);
+        if (!bufGamma || !bufBeta) return;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        int channels_per_group = channels / num_groups;
+        int total_groups = batch * num_groups;
+
+        [encoder setComputePipelineState:g_group_norm_f32_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bufGamma offset:0 atIndex:1];
+        [encoder setBuffer:bufBeta offset:0 atIndex:2];
+        [encoder setBuffer:out->buffer offset:0 atIndex:3];
+        [encoder setBytes:&channels length:sizeof(int) atIndex:4];
+        [encoder setBytes:&spatial length:sizeof(int) atIndex:5];
+        [encoder setBytes:&channels_per_group length:sizeof(int) atIndex:6];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:7];
+
+        /* One threadgroup per (batch, group) pair */
+        NSUInteger threads_per_group = 256;
+        [encoder dispatchThreadgroups:MTLSizeMake(total_groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        }
+    }
+}
+
+/* Swish/SiLU on f32 GPU tensor */
+void flux_gpu_swish_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x, int n) {
+    if (!g_shaders_initialized || !g_swish_f32_pipeline) return;
+    if (!out || !x || n <= 0) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_swish_f32_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = ((NSUInteger)n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        }
+    }
+}
+
+/* Element-wise add on f32 GPU tensors */
+void flux_gpu_add_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tensor_t b, int n) {
+    if (!g_shaders_initialized || !g_add_f32_pipeline) return;
+    if (!out || !a || !b || n <= 0) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_add_f32_pipeline];
+        [encoder setBuffer:a->buffer offset:0 atIndex:0];
+        [encoder setBuffer:b->buffer offset:0 atIndex:1];
+        [encoder setBuffer:out->buffer offset:0 atIndex:2];
+        [encoder setBytes:&n length:sizeof(int) atIndex:3];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = ((NSUInteger)n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        a->has_pending_work = 1;
+        b->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            a->has_pending_work = 0;
+            b->has_pending_work = 0;
+        }
+    }
+}
+
+/* Nearest neighbor 2x upsample on f32 GPU tensor */
+flux_gpu_tensor_t flux_gpu_upsample_nearest_2x_f32(flux_gpu_tensor_t x,
+                                                     int channels, int H, int W) {
+    if (!g_shaders_initialized || !g_upsample_nearest_2x_f32_pipeline) return NULL;
+    if (!x || channels <= 0 || H <= 0 || W <= 0) return NULL;
+
+    int out_h = H * 2;
+    int out_w = W * 2;
+    size_t out_elems = (size_t)channels * out_h * out_w;
+    flux_gpu_tensor_t out = flux_gpu_tensor_alloc(out_elems);
+    if (!out) return NULL;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_upsample_nearest_2x_f32_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&channels length:sizeof(int) atIndex:2];
+        [encoder setBytes:&H length:sizeof(int) atIndex:3];
+        [encoder setBytes:&W length:sizeof(int) atIndex:4];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (out_elems + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        }
+    }
+
+    return out;
+}
+
+/* GPU blit copy for f32 tensors */
+void flux_gpu_copy_f32(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n) {
+    if (!g_initialized || !dst || !src || n == 0) return;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
+        size_t bytes = n * sizeof(float);
+        [blit copyFromBuffer:src->buffer sourceOffset:0
+                    toBuffer:dst->buffer destinationOffset:0
+                        size:bytes];
+        [blit endEncoding];
+        dst->has_pending_work = 1;
+        src->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            dst->has_pending_work = 0;
+            src->has_pending_work = 0;
+        }
+    }
+}
+
+/* Conv2d on f32 GPU tensors using MPSGraph within the batch system */
+flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
+                                       const float *weight, const float *bias,
+                                       int batch, int in_ch, int out_ch,
+                                       int H, int W, int kH, int kW,
+                                       int stride, int padding) {
+    if (!g_initialized || !x || !weight || !bias) return NULL;
+    if (batch <= 0 || in_ch <= 0 || out_ch <= 0 ||
+        H <= 0 || W <= 0 || kH <= 0 || kW <= 0 || stride <= 0) return NULL;
+
+    conv2d_graph_cache_t *cache = get_conv2d_graph_cache(batch, in_ch, out_ch,
+                                                         H, W, kH, kW,
+                                                         stride, padding);
+    if (!cache || !cache->graph) return NULL;
+
+    int outH = (H + 2 * padding - kH) / stride + 1;
+    int outW = (W + 2 * padding - kW) / stride + 1;
+    if (outH <= 0 || outW <= 0) return NULL;
+
+    size_t out_elems = (size_t)batch * out_ch * outH * outW;
+    size_t w_bytes = (size_t)out_ch * in_ch * kH * kW * sizeof(float);
+    size_t b_bytes = (size_t)out_ch * sizeof(float);
+
+    flux_gpu_tensor_t out = flux_gpu_tensor_alloc(out_elems);
+    if (!out) return NULL;
+
+    @autoreleasepool {
+        id<MTLBuffer> w_buf = get_cached_weight_buffer(weight, w_bytes);
+        id<MTLBuffer> b_buf = get_cached_weight_buffer(bias, b_bytes);
+        if (!w_buf || !b_buf) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        if (!cmdBuffer) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        MPSCommandBuffer *mpsCmd = nil;
+        if (g_tensor_batch_mode) {
+            mpsCmd = [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer];
+        } else {
+            mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
+        }
+        if (!mpsCmd) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        MPSGraphTensorData *in_data =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:x->buffer
+                                                   shape:cache->inputShape
+                                                dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *w_data =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:w_buf
+                                                   shape:cache->weightShape
+                                                dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *b_data =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:b_buf
+                                                   shape:cache->biasShape
+                                                dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *out_data =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:out->buffer
+                                                   shape:cache->outShape
+                                                dataType:MPSDataTypeFloat32];
+        if (!in_data || !w_data || !b_data || !out_data) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        NSDictionary *feeds = @{
+            cache->inputTensor : in_data,
+            cache->weightTensor : w_data,
+            cache->biasTensor : b_data
+        };
+        NSDictionary *results = @{ cache->outTensor : out_data };
+
+        @try {
+            [cache->graph encodeToCommandBuffer:mpsCmd
+                                          feeds:feeds
+                               targetOperations:nil
+                              resultsDictionary:results
+                            executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [mpsCmd commit];
+            [mpsCmd waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        } else {
+            /* MPSGraph may commit-and-continue; update the live buffer. */
+            g_tensor_cmd = [mpsCmd rootCommandBuffer];
+        }
+    }
+
+    return out;
 }
 

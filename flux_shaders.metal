@@ -2007,3 +2007,130 @@ kernel void rope_bf16(
         }
     }
 }
+
+/* ========================================================================
+ * F32 VAE Shaders — GPU-resident VAE decoder operations
+ * ======================================================================== */
+
+/* GroupNorm f32: one threadgroup per (batch, group) pair.
+ * Layout: [batch, channels, H, W] (NCHW)
+ * Each group has channels_per_group consecutive channels.
+ * Computes mean and variance over all spatial positions × channels in the group. */
+kernel void group_norm_f32(
+    device const float *x [[buffer(0)]],
+    device const float *gamma [[buffer(1)]],
+    device const float *beta [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &channels [[buffer(4)]],
+    constant int &spatial [[buffer(5)]],       /* H * W */
+    constant int &channels_per_group [[buffer(6)]],
+    constant float &eps [[buffer(7)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+    threadgroup float shared_sum2[256];
+
+    /* group_id encodes (batch, group) */
+    int num_groups = channels / channels_per_group;
+    int batch_idx = group_id / num_groups;
+    int group_idx = group_id % num_groups;
+
+    int c_start = group_idx * channels_per_group;
+    int group_size = channels_per_group * spatial;
+
+    /* Base offset for this batch element */
+    device const float *x_batch = x + batch_idx * channels * spatial;
+    device float *out_batch = out + batch_idx * channels * spatial;
+
+    /* Compute partial sums for mean and variance */
+    float local_sum = 0.0f;
+    float local_sum2 = 0.0f;
+    for (int i = tid; i < group_size; i += threads) {
+        int c = c_start + i / spatial;
+        int s = i % spatial;
+        float val = x_batch[c * spatial + s];
+        local_sum += val;
+        local_sum2 += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    shared_sum2[tid] = local_sum2;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Parallel reduction */
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+            shared_sum2[tid] += shared_sum2[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float mean = shared_sum[0] / float(group_size);
+    float var = shared_sum2[0] / float(group_size) - mean * mean;
+    float inv_std = rsqrt(var + eps);
+
+    /* Apply normalization with gamma/beta per channel */
+    for (int i = tid; i < group_size; i += threads) {
+        int c = c_start + i / spatial;
+        int s = i % spatial;
+        int idx = c * spatial + s;
+        float val = (x_batch[idx] - mean) * inv_std;
+        out_batch[idx] = gamma[c] * val + beta[c];
+    }
+}
+
+/* Swish f32: out = x * sigmoid(x), in-place safe (out can alias x) */
+kernel void swish_f32(
+    device const float *x [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant int &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) {
+        float v = x[gid];
+        out[gid] = v / (1.0f + exp(-v));
+    }
+}
+
+/* Add f32: out = a + b, in-place safe (out can alias a or b) */
+kernel void add_f32(
+    device const float *a [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant int &n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) {
+        out[gid] = a[gid] + b[gid];
+    }
+}
+
+/* Upsample nearest 2x f32: [B, C, H, W] -> [B, C, 2H, 2W]
+ * Each thread writes one output element. */
+kernel void upsample_nearest_2x_f32(
+    device const float *x [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant int &channels [[buffer(2)]],
+    constant int &in_h [[buffer(3)]],
+    constant int &in_w [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int out_h = in_h * 2;
+    int out_w = in_w * 2;
+    int out_spatial = out_h * out_w;
+    int total = channels * out_spatial;  /* batch=1 assumed */
+    if (gid >= uint(total)) return;
+
+    int c = gid / out_spatial;
+    int rem = gid % out_spatial;
+    int oy = rem / out_w;
+    int ox = rem % out_w;
+
+    int iy = oy / 2;
+    int ix = ox / 2;
+
+    out[c * out_spatial + oy * out_w + ox] = x[c * in_h * in_w + iy * in_w + ix];
+}

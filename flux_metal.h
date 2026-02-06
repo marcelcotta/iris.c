@@ -465,6 +465,44 @@ void flux_gpu_split_qkv_mlp_bf16(flux_gpu_tensor_t fused,
 void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
                                     flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
 
+/* ========================================================================
+ * F32 VAE Tensor Operations - GPU-resident VAE decoder operations
+ * ======================================================================== */
+
+/* GroupNorm on f32 GPU tensors: out = gamma * (x - mean) / sqrt(var + eps) + beta
+ * x: [batch, channels, H, W] (NCHW)
+ * gamma, beta: [channels] (CPU f32 pointers, cached on GPU)
+ * num_groups: number of groups (e.g. 32)
+ */
+void flux_gpu_group_norm_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                              const float *gamma, const float *beta,
+                              int batch, int channels, int spatial, int num_groups, float eps);
+
+/* Swish/SiLU on f32 GPU tensor: out = x * sigmoid(x), in-place safe */
+void flux_gpu_swish_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t x, int n);
+
+/* Element-wise add on f32 GPU tensors: out = a + b, in-place safe */
+void flux_gpu_add_f32(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tensor_t b, int n);
+
+/* Nearest neighbor 2x upsample on f32 GPU tensor: [B, C, H, W] -> [B, C, 2H, 2W] */
+flux_gpu_tensor_t flux_gpu_upsample_nearest_2x_f32(flux_gpu_tensor_t x,
+                                                     int channels, int H, int W);
+
+/* Conv2d on f32 GPU tensors using MPSGraph.
+ * x: GPU tensor [batch, in_ch, H, W]
+ * weight: CPU f32 [out_ch, in_ch, kH, kW] (cached on GPU)
+ * bias: CPU f32 [out_ch] (cached on GPU)
+ * Returns new GPU tensor [batch, out_ch, outH, outW] or NULL on failure.
+ */
+flux_gpu_tensor_t flux_gpu_conv2d_f32(flux_gpu_tensor_t x,
+                                       const float *weight, const float *bias,
+                                       int batch, int in_ch, int out_ch,
+                                       int H, int W, int kH, int kW,
+                                       int stride, int padding);
+
+/* GPU blit copy for f32 tensors */
+void flux_gpu_copy_f32(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n);
+
 /* Convert f32 GPU tensor to bf16 (returns new tensor) */
 flux_gpu_tensor_t flux_gpu_tensor_f32_to_bf16(flux_gpu_tensor_t f32_tensor);
 
