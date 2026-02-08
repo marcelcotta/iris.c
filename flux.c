@@ -43,8 +43,8 @@ extern flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
 extern float *flux_image_to_tensor(const flux_image *img);
 
 extern flux_transformer_t *flux_transformer_load(FILE *f);
-extern flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, const char *model_dir);
-extern flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf, const char *model_dir);
+extern flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir);
+extern flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir);
 extern void flux_transformer_free(flux_transformer_t *tf);
 extern float *flux_transformer_forward(flux_transformer_t *tf,
                                         const float *img_latent, int img_h, int img_w,
@@ -275,12 +275,16 @@ flux_ctx *flux_load_dir(const char *model_dir) {
         return NULL;
     }
 
-    /* Verify transformer file exists (will be loaded on-demand) */
-    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", model_dir);
+    /* Verify transformer dir exists (will be loaded on-demand) */
+    snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
     if (!file_exists(path)) {
-        set_error("Transformer model file not found");
-        flux_free(ctx);
-        return NULL;
+        /* Fallback: check for single safetensors file */
+        snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", model_dir);
+        if (!file_exists(path)) {
+            set_error("Transformer model not found (missing config.json and safetensors)");
+            flux_free(ctx);
+            return NULL;
+        }
     }
     /* Text encoder and transformer are loaded on-demand to reduce peak memory. */
 
@@ -336,21 +340,11 @@ void flux_release_text_encoder(flux_ctx *ctx) {
 static int flux_load_transformer_if_needed(flux_ctx *ctx) {
     if (ctx->transformer) return 1;  /* Already loaded */
 
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors",
-             ctx->model_dir);
-
     if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 0);
-    safetensors_file_t *sf = safetensors_open(path);
-    if (sf) {
-        if (ctx->use_mmap) {
-            /* Mmap mode: load only small weights, keep sf open for on-demand loading.
-             * The transformer takes ownership of sf and will close it on free. */
-            ctx->transformer = flux_transformer_load_safetensors_mmap(sf, ctx->model_dir);
-        } else {
-            ctx->transformer = flux_transformer_load_safetensors(sf, ctx->model_dir);
-            safetensors_close(sf);
-        }
+    if (ctx->use_mmap) {
+        ctx->transformer = flux_transformer_load_safetensors_mmap(ctx->model_dir);
+    } else {
+        ctx->transformer = flux_transformer_load_safetensors(ctx->model_dir);
     }
     if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 1);
 

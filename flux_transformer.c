@@ -281,7 +281,9 @@ typedef struct flux_transformer {
 
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
-    safetensors_file_t *sf;
+    #define MAX_TF_SHARDS 4
+    safetensors_file_t *sf_files[MAX_TF_SHARDS];
+    int num_sf_files;
 } flux_transformer_t;
 
 /* ========================================================================
@@ -352,11 +354,100 @@ static int parse_transformer_config(const char *model_dir, flux_transformer_t *t
     return 0;
 }
 
+/* Open transformer safetensors shards.
+ * Reads diffusion_pytorch_model.safetensors.index.json for shard filenames,
+ * falls back to single diffusion_pytorch_model.safetensors.
+ * Returns number of files opened (0 on failure). */
+static int open_transformer_shards(const char *model_dir,
+                                   safetensors_file_t **files, int max_files) {
+    char path[1024];
+    int num_files = 0;
+
+    /* Try to read index JSON for sharded models */
+    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors.index.json",
+             model_dir);
+    FILE *fp = fopen(path, "r");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        long len = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        char *json = malloc(len + 1);
+        if (json) {
+            fread(json, 1, len, fp);
+            json[len] = '\0';
+            fclose(fp);
+
+            /* Extract unique shard filenames from weight_map values */
+            char shard_names[MAX_TF_SHARDS][256];
+            int num_shards = 0;
+            const char *p = strstr(json, "\"weight_map\"");
+            if (p) {
+                p = strchr(p, '{');
+                if (p) p++;
+                while (p && num_shards < max_files) {
+                    /* Find next value (shard filename) */
+                    const char *colon = strchr(p, ':');
+                    if (!colon) break;
+                    const char *q1 = strchr(colon, '"');
+                    if (!q1) break;
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (!q2) break;
+                    int slen = (int)(q2 - q1);
+                    if (slen > 0 && slen < 256) {
+                        char fname[256];
+                        memcpy(fname, q1, slen);
+                        fname[slen] = '\0';
+                        /* Check if already seen */
+                        int dup = 0;
+                        for (int i = 0; i < num_shards; i++) {
+                            if (strcmp(shard_names[i], fname) == 0) { dup = 1; break; }
+                        }
+                        if (!dup) {
+                            strcpy(shard_names[num_shards], fname);
+                            num_shards++;
+                        }
+                    }
+                    p = q2 + 1;
+                    /* Skip to next key or end */
+                    const char *comma = strchr(p, ',');
+                    const char *brace = strchr(p, '}');
+                    if (brace && (!comma || brace < comma)) break;
+                    if (comma) p = comma + 1; else break;
+                }
+            }
+            free(json);
+
+            /* Open each shard */
+            for (int i = 0; i < num_shards; i++) {
+                snprintf(path, sizeof(path), "%s/transformer/%s", model_dir, shard_names[i]);
+                files[num_files] = safetensors_open(path);
+                if (files[num_files]) {
+                    num_files++;
+                } else {
+                    fprintf(stderr, "Warning: failed to open shard %s\n", shard_names[i]);
+                }
+            }
+            if (num_files > 0) return num_files;
+        } else {
+            fclose(fp);
+        }
+    }
+
+    /* Fallback: single file */
+    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors",
+             model_dir);
+    files[0] = safetensors_open(path);
+    if (files[0]) return 1;
+
+    return 0;
+}
+
 /* Forward declarations */
 void flux_transformer_free(flux_transformer_t *tf);
-static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
+static int load_double_block_weights(double_block_t *b, safetensors_file_t **files, int num_files, int idx, int h, int mlp, int use_bf16);
 static void free_double_block_weights(double_block_t *b);
-static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
+static int load_single_block_weights(single_block_t *b, safetensors_file_t **files, int num_files, int idx, int h, int mlp, int use_bf16);
 static void free_single_block_weights(single_block_t *b);
 
 /* ========================================================================
@@ -364,61 +455,62 @@ static void free_single_block_weights(single_block_t *b);
  * ======================================================================== */
 
 /* Helper to get tensor as f32 (used by mmap load functions) */
-static float *mmap_get_f32(safetensors_file_t *sf, const char *name) {
-    const safetensor_t *t = safetensors_find(sf, name);
-    if (!t) {
-        fprintf(stderr, "Error: required tensor %s not found\n", name);
-        return NULL;
+static float *mmap_get_f32(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t) return safetensors_get_f32(files[f], t);
     }
-    return safetensors_get_f32(sf, t);
+    fprintf(stderr, "Error: required tensor %s not found\n", name);
+    return NULL;
 }
 
 /* Helper to get tensor as bf16 direct pointer (used by mmap load functions)
  * Returns pointer into mmap'd region - caller must NOT free */
-static uint16_t *mmap_get_bf16(safetensors_file_t *sf, const char *name) {
-    const safetensor_t *t = safetensors_find(sf, name);
-    if (!t) return NULL;
-    if (!safetensor_is_bf16(t)) return NULL;
-    return safetensors_get_bf16_direct(sf, t);
+static uint16_t *mmap_get_bf16(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t && safetensor_is_bf16(t)) return safetensors_get_bf16_direct(files[f], t);
+    }
+    return NULL;
 }
 
 /* Load weights for a single double_block on-demand */
-static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
-                                     int idx, int h, int mlp, int use_bf16) {
+static int load_double_block_weights(double_block_t *b, safetensors_file_t **files,
+                                     int num_files, int idx, int h, int mlp, int use_bf16) {
     char name[256];
 
     /* Image attention - QK norm weights (always f32) */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_q.weight", idx);
-    b->img_norm_q_weight = mmap_get_f32(sf, name);
+    b->img_norm_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", idx);
-    b->img_norm_k_weight = mmap_get_f32(sf, name);
+    b->img_norm_k_weight = mmap_get_f32(files, num_files, name);
 
     /* Image Q, K, V projections - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_q.weight", idx);
-    if (use_bf16) b->img_q_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_q_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_q_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_k.weight", idx);
-    if (use_bf16) b->img_k_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_k_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_k_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_k_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_v.weight", idx);
-    if (use_bf16) b->img_v_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_v_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_v_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_v_weight = mmap_get_f32(files, num_files, name);
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_out.0.weight", idx);
-    if (use_bf16) b->img_proj_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_proj_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_proj_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_proj_weight = mmap_get_f32(files, num_files, name);
 
     /* Image FFN - linear_in contains gate and up fused - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_in.weight", idx);
     if (use_bf16) {
-        uint16_t *ff_in_bf16 = mmap_get_bf16(sf, name);
+        uint16_t *ff_in_bf16 = mmap_get_bf16(files, num_files, name);
         if (ff_in_bf16) {
             /* Direct pointers with offset - no malloc/copy needed */
             b->img_mlp_gate_weight_bf16 = ff_in_bf16;
             b->img_mlp_up_weight_bf16 = ff_in_bf16 + (size_t)mlp * h;
         }
     } else {
-        float *ff_in = mmap_get_f32(sf, name);
+        float *ff_in = mmap_get_f32(files, num_files, name);
         if (ff_in) {
             b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
             b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -429,41 +521,41 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
     }
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_out.weight", idx);
-    if (use_bf16) b->img_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->img_mlp_down_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->img_mlp_down_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->img_mlp_down_weight = mmap_get_f32(files, num_files, name);
 
     /* Text stream - QK norm weights (always f32) */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_q.weight", idx);
-    b->txt_norm_q_weight = mmap_get_f32(sf, name);
+    b->txt_norm_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_k.weight", idx);
-    b->txt_norm_k_weight = mmap_get_f32(sf, name);
+    b->txt_norm_k_weight = mmap_get_f32(files, num_files, name);
 
     /* Text Q, K, V projections - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_q_proj.weight", idx);
-    if (use_bf16) b->txt_q_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_q_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_q_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_k_proj.weight", idx);
-    if (use_bf16) b->txt_k_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_k_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_k_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_k_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_v_proj.weight", idx);
-    if (use_bf16) b->txt_v_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_v_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_v_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_v_weight = mmap_get_f32(files, num_files, name);
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_add_out.weight", idx);
-    if (use_bf16) b->txt_proj_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_proj_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_proj_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_proj_weight = mmap_get_f32(files, num_files, name);
 
     /* Text FFN - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_in.weight", idx);
     if (use_bf16) {
-        uint16_t *txt_ff_in_bf16 = mmap_get_bf16(sf, name);
+        uint16_t *txt_ff_in_bf16 = mmap_get_bf16(files, num_files, name);
         if (txt_ff_in_bf16) {
             /* Direct pointers with offset - no malloc/copy needed */
             b->txt_mlp_gate_weight_bf16 = txt_ff_in_bf16;
             b->txt_mlp_up_weight_bf16 = txt_ff_in_bf16 + (size_t)mlp * h;
         }
     } else {
-        float *txt_ff_in = mmap_get_f32(sf, name);
+        float *txt_ff_in = mmap_get_f32(files, num_files, name);
         if (txt_ff_in) {
             b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
             b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -474,8 +566,8 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
     }
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_out.weight", idx);
-    if (use_bf16) b->txt_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->txt_mlp_down_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->txt_mlp_down_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->txt_mlp_down_weight = mmap_get_f32(files, num_files, name);
 
     return 0;
 }
@@ -520,26 +612,26 @@ static void free_double_block_weights(double_block_t *b) {
 }
 
 /* Load weights for a single single_block on-demand */
-static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf,
-                                     int idx, int h, int mlp, int use_bf16) {
+static int load_single_block_weights(single_block_t *b, safetensors_file_t **files,
+                                     int num_files, int idx, int h, int mlp, int use_bf16) {
     char name[256];
     (void)h; (void)mlp;  /* Unused in single block */
 
     /* QK norm weights (always f32, small) */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_q.weight", idx);
-    b->norm_q_weight = mmap_get_f32(sf, name);
+    b->norm_q_weight = mmap_get_f32(files, num_files, name);
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_k.weight", idx);
-    b->norm_k_weight = mmap_get_f32(sf, name);
+    b->norm_k_weight = mmap_get_f32(files, num_files, name);
 
     /* Fused QKV+MLP input projection - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj.weight", idx);
-    if (use_bf16) b->qkv_mlp_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->qkv_mlp_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->qkv_mlp_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->qkv_mlp_weight = mmap_get_f32(files, num_files, name);
 
     /* Fused attn out + MLP down projection - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_out.weight", idx);
-    if (use_bf16) b->proj_mlp_weight_bf16 = mmap_get_bf16(sf, name);
-    if (!use_bf16) b->proj_mlp_weight = mmap_get_f32(sf, name);
+    if (use_bf16) b->proj_mlp_weight_bf16 = mmap_get_bf16(files, num_files, name);
+    if (!use_bf16) b->proj_mlp_weight = mmap_get_f32(files, num_files, name);
 
     return 0;
 }
@@ -579,7 +671,7 @@ static void warmup_mmap_bf16_buffers(flux_transformer_t *tf) {
 
     /* Double blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
-        load_double_block_weights(&tf->double_blocks[i], tf->sf, i, h, mlp, 1);
+        load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
         double_block_t *b = &tf->double_blocks[i];
 
         if (b->img_q_weight_bf16)
@@ -617,7 +709,7 @@ static void warmup_mmap_bf16_buffers(flux_transformer_t *tf) {
 
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
-        load_single_block_weights(&tf->single_blocks[i], tf->sf, i, h, mlp, 1);
+        load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
         single_block_t *b = &tf->single_blocks[i];
 
         if (b->qkv_mlp_weight_bf16)
@@ -2903,7 +2995,7 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     /* Double-stream blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         if (!double_block_forward_bf16(img_hidden, txt_hidden,
@@ -2932,7 +3024,7 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     /* Single-stream blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
 
@@ -3304,7 +3396,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     for (int i = 0; i < tf->num_double_layers; i++) {
         /* In mmap mode, load block weights on-demand */
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         double_block_forward(img_hidden, txt_hidden,
@@ -3529,7 +3621,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
         for (int i = 0; i < tf->num_single_layers; i++) {
             /* In mmap mode, load block weights on-demand */
             if (tf->use_mmap) {
-                load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+                load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                           tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             }
 #ifdef USE_METAL
@@ -3777,7 +3869,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     /* Double blocks - process combined image with text */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         double_block_forward(combined_hidden, txt_hidden,
@@ -3803,7 +3895,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         single_block_forward(concat_hidden, &tf->single_blocks[i],
@@ -4021,7 +4113,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     /* Double blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         double_block_forward(combined_hidden, txt_hidden,
@@ -4046,7 +4138,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         single_block_forward(concat_hidden, &tf->single_blocks[i],
@@ -4370,10 +4462,12 @@ void flux_transformer_free(flux_transformer_t *tf) {
     free(tf->cached_combined_rope_cos);
     free(tf->cached_combined_rope_sin);
 
-    /* Close safetensors file if in mmap mode */
-    if (tf->use_mmap && tf->sf) {
-        safetensors_close(tf->sf);
-        tf->sf = NULL;
+    /* Close safetensors files if in mmap mode */
+    if (tf->use_mmap) {
+        for (int i = 0; i < tf->num_sf_files; i++) {
+            if (tf->sf_files[i]) safetensors_close(tf->sf_files[i]);
+        }
+        tf->num_sf_files = 0;
     }
 
     free(tf);
@@ -4383,25 +4477,25 @@ void flux_transformer_free(flux_transformer_t *tf) {
  * Safetensors Loading
  * ======================================================================== */
 
-static float *get_sf_tensor_tf(safetensors_file_t *sf, const char *name) {
-    const safetensor_t *t = safetensors_find(sf, name);
-    if (!t) {
-        fprintf(stderr, "Error: required tensor %s not found\n", name);
-        return NULL;
+static float *get_sf_tensor_tf(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t) return safetensors_get_f32(files[f], t);
     }
-    return safetensors_get_f32(sf, t);
+    fprintf(stderr, "Error: required tensor %s not found\n", name);
+    return NULL;
 }
 
 /* Get tensor as bf16 (for GPU acceleration) */
-static uint16_t *get_sf_tensor_bf16(safetensors_file_t *sf, const char *name) {
-    const safetensor_t *t = safetensors_find(sf, name);
-    if (!t) {
-        return NULL;  /* Not an error - bf16 is optional */
+static uint16_t *get_sf_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t) {
+            if (!safetensor_is_bf16(t)) return NULL;
+            return safetensors_get_bf16(files[f], t);
+        }
     }
-    if (!safetensor_is_bf16(t)) {
-        return NULL;  /* Not bf16, will use f32 version */
-    }
-    return safetensors_get_bf16(sf, t);
+    return NULL;  /* Not found - bf16 is optional */
 }
 
 #ifdef USE_METAL
@@ -4476,7 +4570,7 @@ static void warmup_bf16_weights(flux_transformer_t *tf) {
 }
 #endif /* USE_METAL */
 
-flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, const char *model_dir) {
+flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
     flux_transformer_t *tf = calloc(1, sizeof(flux_transformer_t));
     if (!tf) return NULL;
 
@@ -4496,12 +4590,16 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, co
         tf->rope_dim = 128;
         tf->axis_dim = 32;
     }
-    /* Max sequence length must accommodate image + text tokens combined.
-     * At 1024x1024: img_seq = (1024/8)^2 = 16384, txt_seq = 512, total = 16896
-     * At 1792x1792: img_seq = (1792/8)^2 = 50176, txt_seq = 512, total = 50688
-     * We set 52000 to support up to 1792x1792 with margin.
-     */
     tf->max_seq_len = 52000;
+
+    /* Open safetensors shards */
+    safetensors_file_t *files[MAX_TF_SHARDS];
+    int num_files = open_transformer_shards(model_dir, files, MAX_TF_SHARDS);
+    if (num_files == 0) {
+        fprintf(stderr, "flux_transformer_load: failed to open safetensors files\n");
+        free(tf);
+        return NULL;
+    }
 
     /* Enable bf16 mode if Metal GPU is available */
 #ifdef USE_METAL
@@ -4519,29 +4617,26 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, co
 
     /* Input projections */
     if (tf->use_bf16) {
-        tf->img_in_weight_bf16 = get_sf_tensor_bf16(sf, "x_embedder.weight");
-        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(sf, "context_embedder.weight");
+        tf->img_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "x_embedder.weight");
+        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "context_embedder.weight");
     } else {
-        tf->img_in_weight = get_sf_tensor_tf(sf, "x_embedder.weight");
-        tf->txt_in_weight = get_sf_tensor_tf(sf, "context_embedder.weight");
+        tf->img_in_weight = get_sf_tensor_tf(files, num_files, "x_embedder.weight");
+        tf->txt_in_weight = get_sf_tensor_tf(files, num_files, "context_embedder.weight");
     }
 
-    /* Time embedding
-     * FLUX.2-klein uses 256-dim sinusoidal embedding (128 frequencies)
-     * linear_1: [3072, 256], linear_2: [3072, 3072]
-     */
+    /* Time embedding */
     tf->time_embed.sincos_dim = 256;
-    tf->time_embed.fc1_weight = get_sf_tensor_tf(sf,
+    tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
         "time_guidance_embed.timestep_embedder.linear_1.weight");
-    tf->time_embed.fc2_weight = get_sf_tensor_tf(sf,
+    tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
         "time_guidance_embed.timestep_embedder.linear_2.weight");
 
     /* Modulation weights - these are always needed in f32 for CPU modulation computation */
-    tf->adaln_double_img_weight = get_sf_tensor_tf(sf,
+    tf->adaln_double_img_weight = get_sf_tensor_tf(files, num_files,
         "double_stream_modulation_img.linear.weight");
-    tf->adaln_double_txt_weight = get_sf_tensor_tf(sf,
+    tf->adaln_double_txt_weight = get_sf_tensor_tf(files, num_files,
         "double_stream_modulation_txt.linear.weight");
-    tf->adaln_single_weight = get_sf_tensor_tf(sf,
+    tf->adaln_single_weight = get_sf_tensor_tf(files, num_files,
         "single_stream_modulation.linear.weight");
 
     /* Double blocks */
@@ -4551,29 +4646,29 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, co
 
         /* Image attention - QK norm weights (always f32) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_q.weight", i);
-        b->img_norm_q_weight = get_sf_tensor_tf(sf, name);
+        b->img_norm_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", i);
-        b->img_norm_k_weight = get_sf_tensor_tf(sf, name);
+        b->img_norm_k_weight = get_sf_tensor_tf(files, num_files, name);
 
         /* Image Q, K, V projections (separate) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_q.weight", i);
-        if (tf->use_bf16) b->img_q_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_q_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_q_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_k.weight", i);
-        if (tf->use_bf16) b->img_k_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_k_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_k_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_k_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_v.weight", i);
-        if (tf->use_bf16) b->img_v_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_v_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_v_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_v_weight = get_sf_tensor_tf(files, num_files, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_out.0.weight", i);
-        if (tf->use_bf16) b->img_proj_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_proj_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_proj_weight = get_sf_tensor_tf(files, num_files, name);
 
-        /* Image FFN - linear_in contains gate and up fused (18432 = 2*9216) */
+        /* Image FFN - linear_in contains gate and up fused */
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_in.weight", i);
         if (tf->use_bf16) {
-            uint16_t *ff_in_bf16 = get_sf_tensor_bf16(sf, name);
+            uint16_t *ff_in_bf16 = get_sf_tensor_bf16(files, num_files, name);
             if (ff_in_bf16) {
                 b->img_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
                 b->img_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
@@ -4582,7 +4677,7 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, co
                 free(ff_in_bf16);
             }
         } else {
-            float *ff_in = get_sf_tensor_tf(sf, name);
+            float *ff_in = get_sf_tensor_tf(files, num_files, name);
             if (ff_in) {
                 b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
                 b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -4593,33 +4688,33 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, co
         }
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_out.weight", i);
-        if (tf->use_bf16) b->img_mlp_down_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->img_mlp_down_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_mlp_down_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->img_mlp_down_weight = get_sf_tensor_tf(files, num_files, name);
 
         /* Text stream - QK norm weights (always f32) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_q.weight", i);
-        b->txt_norm_q_weight = get_sf_tensor_tf(sf, name);
+        b->txt_norm_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_k.weight", i);
-        b->txt_norm_k_weight = get_sf_tensor_tf(sf, name);
+        b->txt_norm_k_weight = get_sf_tensor_tf(files, num_files, name);
 
         /* Text Q, K, V projections (separate) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_q_proj.weight", i);
-        if (tf->use_bf16) b->txt_q_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_q_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_q_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_k_proj.weight", i);
-        if (tf->use_bf16) b->txt_k_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_k_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_k_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_k_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_v_proj.weight", i);
-        if (tf->use_bf16) b->txt_v_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_v_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_v_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_v_weight = get_sf_tensor_tf(files, num_files, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_add_out.weight", i);
-        if (tf->use_bf16) b->txt_proj_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_proj_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_proj_weight = get_sf_tensor_tf(files, num_files, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_in.weight", i);
         if (tf->use_bf16) {
-            uint16_t *txt_ff_in_bf16 = get_sf_tensor_bf16(sf, name);
+            uint16_t *txt_ff_in_bf16 = get_sf_tensor_bf16(files, num_files, name);
             if (txt_ff_in_bf16) {
                 b->txt_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
                 b->txt_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
@@ -4628,7 +4723,7 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, co
                 free(txt_ff_in_bf16);
             }
         } else {
-            float *txt_ff_in = get_sf_tensor_tf(sf, name);
+            float *txt_ff_in = get_sf_tensor_tf(files, num_files, name);
             if (txt_ff_in) {
                 b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
                 b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -4639,8 +4734,8 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, co
         }
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_out.weight", i);
-        if (tf->use_bf16) b->txt_mlp_down_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->txt_mlp_down_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_mlp_down_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->txt_mlp_down_weight = get_sf_tensor_tf(files, num_files, name);
     }
 
     /* Single blocks */
@@ -4650,27 +4745,30 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, co
 
         /* QK norm weights (always f32, small) */
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_q.weight", i);
-        b->norm_q_weight = get_sf_tensor_tf(sf, name);
+        b->norm_q_weight = get_sf_tensor_tf(files, num_files, name);
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_k.weight", i);
-        b->norm_k_weight = get_sf_tensor_tf(sf, name);
+        b->norm_k_weight = get_sf_tensor_tf(files, num_files, name);
 
         /* Major linear weights - load bf16 or f32 based on mode */
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj.weight", i);
-        if (tf->use_bf16) b->qkv_mlp_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->qkv_mlp_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->qkv_mlp_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->qkv_mlp_weight = get_sf_tensor_tf(files, num_files, name);
 
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_out.weight", i);
-        if (tf->use_bf16) b->proj_mlp_weight_bf16 = get_sf_tensor_bf16(sf, name);
-        else b->proj_mlp_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->proj_mlp_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
+        else b->proj_mlp_weight = get_sf_tensor_tf(files, num_files, name);
     }
 
     /* Final layer */
-    tf->final_norm_weight = get_sf_tensor_tf(sf, "norm_out.linear.weight");
+    tf->final_norm_weight = get_sf_tensor_tf(files, num_files, "norm_out.linear.weight");
     if (tf->use_bf16) {
-        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(sf, "proj_out.weight");
+        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, "proj_out.weight");
     } else {
-        tf->final_proj_weight = get_sf_tensor_tf(sf, "proj_out.weight");
+        tf->final_proj_weight = get_sf_tensor_tf(files, num_files, "proj_out.weight");
     }
+
+    /* Close safetensors files (non-mmap: data already copied) */
+    for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
 
     /* Precompute RoPE frequencies */
     tf->rope_freqs = malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
@@ -4725,8 +4823,8 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, co
     return tf;
 }
 
-/* Load transformer in mmap mode - only load small weights, keep sf open for block loading */
-flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf, const char *model_dir) {
+/* Load transformer in mmap mode - only load small weights, keep files open for block loading */
+flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir) {
     flux_transformer_t *tf = calloc(1, sizeof(flux_transformer_t));
     if (!tf) return NULL;
 
@@ -4746,9 +4844,14 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
     }
     tf->max_seq_len = 52000;  /* Support up to 1792x1792 */
 
-    /* Enable mmap mode - keep sf open, don't load block weights yet */
+    /* Open safetensors shards and keep them open for on-demand loading */
     tf->use_mmap = 1;
-    tf->sf = sf;
+    tf->num_sf_files = open_transformer_shards(model_dir, tf->sf_files, MAX_TF_SHARDS);
+    if (tf->num_sf_files == 0) {
+        fprintf(stderr, "flux_transformer_load_mmap: failed to open safetensors files\n");
+        free(tf);
+        return NULL;
+    }
 
     /* Enable bf16 mode if Metal GPU is available */
 #ifdef USE_METAL
@@ -4761,34 +4864,37 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
     tf->use_bf16 = 0;
 #endif
 
+    safetensors_file_t **files = tf->sf_files;
+    int num_files = tf->num_sf_files;
+
     /* Input projections - always load (small) */
-    tf->img_in_weight = get_sf_tensor_tf(sf, "x_embedder.weight");
-    tf->txt_in_weight = get_sf_tensor_tf(sf, "context_embedder.weight");
+    tf->img_in_weight = get_sf_tensor_tf(files, num_files, "x_embedder.weight");
+    tf->txt_in_weight = get_sf_tensor_tf(files, num_files, "context_embedder.weight");
     if (tf->use_bf16) {
-        tf->img_in_weight_bf16 = get_sf_tensor_bf16(sf, "x_embedder.weight");
-        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(sf, "context_embedder.weight");
+        tf->img_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "x_embedder.weight");
+        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "context_embedder.weight");
     }
 
     /* Time embedding - always load (small) */
     tf->time_embed.sincos_dim = 256;
-    tf->time_embed.fc1_weight = get_sf_tensor_tf(sf,
+    tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
         "time_guidance_embed.timestep_embedder.linear_1.weight");
-    tf->time_embed.fc2_weight = get_sf_tensor_tf(sf,
+    tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
         "time_guidance_embed.timestep_embedder.linear_2.weight");
 
     /* Modulation weights - always load */
-    tf->adaln_double_img_weight = get_sf_tensor_tf(sf,
+    tf->adaln_double_img_weight = get_sf_tensor_tf(files, num_files,
         "double_stream_modulation_img.linear.weight");
-    tf->adaln_double_txt_weight = get_sf_tensor_tf(sf,
+    tf->adaln_double_txt_weight = get_sf_tensor_tf(files, num_files,
         "double_stream_modulation_txt.linear.weight");
-    tf->adaln_single_weight = get_sf_tensor_tf(sf,
+    tf->adaln_single_weight = get_sf_tensor_tf(files, num_files,
         "single_stream_modulation.linear.weight");
     if (tf->use_bf16) {
-        tf->adaln_double_img_weight_bf16 = get_sf_tensor_bf16(sf,
+        tf->adaln_double_img_weight_bf16 = get_sf_tensor_bf16(files, num_files,
             "double_stream_modulation_img.linear.weight");
-        tf->adaln_double_txt_weight_bf16 = get_sf_tensor_bf16(sf,
+        tf->adaln_double_txt_weight_bf16 = get_sf_tensor_bf16(files, num_files,
             "double_stream_modulation_txt.linear.weight");
-        tf->adaln_single_weight_bf16 = get_sf_tensor_bf16(sf,
+        tf->adaln_single_weight_bf16 = get_sf_tensor_bf16(files, num_files,
             "single_stream_modulation.linear.weight");
     }
 
@@ -4797,10 +4903,10 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
     tf->single_blocks = calloc(tf->num_single_layers, sizeof(single_block_t));
 
     /* Final layer - always load (small) */
-    tf->final_norm_weight = get_sf_tensor_tf(sf, "norm_out.linear.weight");
-    tf->final_proj_weight = get_sf_tensor_tf(sf, "proj_out.weight");
+    tf->final_norm_weight = get_sf_tensor_tf(files, num_files, "norm_out.linear.weight");
+    tf->final_proj_weight = get_sf_tensor_tf(files, num_files, "proj_out.weight");
     if (tf->use_bf16) {
-        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(sf, "proj_out.weight");
+        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, "proj_out.weight");
     }
 
     /* Precompute RoPE frequencies */
