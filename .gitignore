@@ -5,9 +5,10 @@
 flux
 
 # Model weights (large files)
-flux-klein-model/
-flux-klein-base-model/
-flux-klein-9b-model/
+flux-klein-4b/
+flux-klein-4b-base/
+flux-klein-9b/
+flux-klein-9b-base/
 
 # Tokens and planning docs
 hf_token.txt

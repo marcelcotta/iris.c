@@ -45,7 +45,7 @@ endif
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
 	@echo ""
-	@echo "Example: make mps && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
+	@echo "Example: make mps && ./flux -d flux-klein-4b -p \"a cat\" -o cat.png"
 
 # =============================================================================
 # Backend: generic (pure C, no BLAS)

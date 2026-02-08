@@ -107,7 +107,7 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
 def main():
     parser = argparse.ArgumentParser(description="Run FLUX inference tests")
     parser.add_argument("--flux-binary", default="./flux", help="Path to flux binary")
-    parser.add_argument("--model-dir", default="flux-klein-model", help="Path to model")
+    parser.add_argument("--model-dir", default="flux-klein-4b", help="Path to model")
     parser.add_argument("--quick", action="store_true", help="Run only the quick 64x64 test")
     args = parser.parse_args()
 

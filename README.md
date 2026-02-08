@@ -7,6 +7,7 @@ Supported models:
 - **Flux.2 Klein 4B distilled** (4 steps, auto guidance set to 1, very fast).
 - **Flux.2 Klein 4B base** (50 steps for max quality, or less. Classifier-Free Diffusion Guidance, much slower but more generation variety).
 - **Flux.2 Klein 9B distilled** (4 steps, larger model, higher quality. Non-commercial license).
+- **Flux.2 Klein 9B base** (50 steps, CFG, highest quality. Non-commercial license).
 
 ## Quick Start
 
@@ -17,18 +18,18 @@ make mps       # Apple Silicon (fastest)
 # or: make generic # Pure C, no dependencies
 
 # Download the model (~16GB) - pick one:
-./download_model.sh                      # using curl
-# or: pip install huggingface_hub && python download_model.py
+./download_model.sh 4b                   # using curl
+# or: pip install huggingface_hub && python download_model.py 4b
 
 # Generate an image
-./flux -d flux-klein-model -p "A woman wearing sunglasses" -o output.png
+./flux -d flux-klein-4b -p "A woman wearing sunglasses" -o output.png
 ```
 
 If you want to try the base model, instead of the distilled one (much slower, higher quality), use the following instructions. Use 10 steps if your computer is quite slow, instead of the default of 50, it will still work well enough to test it (10 seconds to generate a 256x256 image on a MacBook M3 Max).
 ```
-./download_model.sh --base
-# or: pip install huggingface_hub && python download_model.py --base
-./flux -d flux-klein-base-model -p "A woman wearing sunglasses" -o output.png
+./download_model.sh 4b-base
+# or: pip install huggingface_hub && python download_model.py 4b-base
+./flux -d flux-klein-4b-base -p "A woman wearing sunglasses" -o output.png
 ```
 
 If you want to try the 9B model (higher quality, non-commercial license, ~30GB download):
@@ -36,10 +37,10 @@ If you want to try the 9B model (higher quality, non-commercial license, ~30GB d
 # 9B is a gated model - you need a HuggingFace token
 # 1. Accept the license at https://huggingface.co/black-forest-labs/FLUX.2-klein-9B
 # 2. Get your token from https://huggingface.co/settings/tokens
-./download_model.sh --9b --token YOUR_TOKEN
-# or: python download_model.py --9b --token YOUR_TOKEN
+./download_model.sh 9b --token YOUR_TOKEN
+# or: python download_model.py 9b --token YOUR_TOKEN
 # or: set HF_TOKEN env var, or save token to hf_token.txt
-./flux -d flux-klein-9b-model -p "A woman wearing sunglasses" -o output.png
+./flux -d flux-klein-9b -p "A woman wearing sunglasses" -o output.png
 ```
 
 That's it. No Python runtime or CUDA toolkit required at inference time.
@@ -48,13 +49,13 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 
 ![Woman with sunglasses](images/woman_with_sunglasses.png)
 
-*Generated with: `./flux -d flux-klein-model -p "A picture of a woman in 1960 America. Sunglasses. ASA 400 film. Black and White." -W 512 -H 512 -o woman.png`*
+*Generated with: `./flux -d flux-klein-4b -p "A picture of a woman in 1960 America. Sunglasses. ASA 400 film. Black and White." -W 512 -H 512 -o woman.png`*
 
 ### Image-to-Image Example
 
 ![antirez to drawing](images/antirez_to_drawing.png)
 
-*Generated with: `./flux -i antirez.png -o antirez_to_drawing.png -p "make it a drawing" -d flux-klein-model`*
+*Generated with: `./flux -i antirez.png -o antirez_to_drawing.png -p "make it a drawing" -d flux-klein-4b`*
 
 ## Features
 
@@ -78,10 +79,10 @@ Display generated images directly in your terminal with `--show`, or watch the d
 
 ```bash
 # Display final image in terminal (auto-detects Kitty/Ghostty/iTerm2/Konsole)
-./flux -d flux-klein-model -p "a cute robot" -o robot.png --show
+./flux -d flux-klein-4b -p "a cute robot" -o robot.png --show
 
 # Display each denoising step (slower, but interesting to watch)
-./flux -d flux-klein-model -p "a cute robot" -o robot.png --show-steps
+./flux -d flux-klein-4b -p "a cute robot" -o robot.png --show-steps
 ```
 
 Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/)), [iTerm2](https://iterm2.com/), or [Konsole](https://konsole.kde.org/). Terminal type is auto-detected from environment variables.
@@ -93,7 +94,7 @@ Use `--zoom N` to adjust the display size (default: 2 for Retina displays, use 1
 ### Text-to-Image
 
 ```bash
-./flux -d flux-klein-model -p "A fluffy orange cat sitting on a windowsill" -o cat.png
+./flux -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" -o cat.png
 ```
 
 ### Image-to-Image
@@ -101,7 +102,7 @@ Use `--zoom N` to adjust the display size (default: 2 for Retina displays, use 1
 Transform an existing image based on a prompt:
 
 ```bash
-./flux -d flux-klein-model -p "oil painting style" -i photo.png -o painting.png
+./flux -d flux-klein-4b -p "oil painting style" -i photo.png -o painting.png
 ```
 
 FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike traditional approaches that add noise to the input image, FLUX.2 passes the reference image as additional tokens that the model can attend to during generation. This means:
@@ -118,7 +119,7 @@ FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike tr
 **Super Resolution:** Since the reference image can be a different size than the output, you can use img2img for upscaling:
 
 ```bash
-./flux -d flux-klein-model -i small.png -W 1024 -H 1024 -o big.png -p "Create an exact copy of the input image."
+./flux -d flux-klein-4b -i small.png -W 1024 -H 1024 -o big.png -p "Create an exact copy of the input image."
 ```
 
 The model will generate a higher-resolution version while preserving the composition and details of the input.
@@ -128,7 +129,7 @@ The model will generate a higher-resolution version while preserving the composi
 Combine elements from multiple reference images:
 
 ```bash
-./flux -d flux-klein-model -i car.png -i beach.png -p "a sports car on the beach" -o result.png
+./flux -d flux-klein-4b -i car.png -i beach.png -p "a sports car on the beach" -o result.png
 ```
 
 Each reference image is encoded separately and passed to the transformer with different positional embeddings (T=10, T=20, T=30, ...). The model attends to all references during generation, allowing it to combine elements from each.
@@ -146,7 +147,7 @@ You can specify up to 16 reference images with multiple `-i` flags. The prompt g
 Start without `-p` to enter interactive mode:
 
 ```bash
-./flux -d flux-klein-model
+./flux -d flux-klein-4b
 ```
 
 Generate images by typing prompts. Each image gets a `$N` reference ID:
@@ -221,7 +222,7 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 
 The seed is always printed to stderr, even when random:
 ```
-$ ./flux -d flux-klein-model -p "a landscape" -o out.png
+$ ./flux -d flux-klein-4b -p "a landscape" -o out.png
 Seed: 1705612345
 ...
 Saving... out.png 256x256 (0.1s)
@@ -229,7 +230,7 @@ Saving... out.png 256x256 (0.1s)
 
 To reproduce the same image, use the printed seed:
 ```
-$ ./flux -d flux-klein-model -p "a landscape" -o out.png -S 1705612345
+$ ./flux -d flux-klein-4b -p "a landscape" -o out.png -S 1705612345
 ```
 
 ## PNG Metadata
@@ -315,32 +316,34 @@ Download model weights from HuggingFace using one of these methods:
 
 **4B Distilled model** (~16GB, fast 4-step inference):
 ```bash
-./download_model.sh                      # using curl
-# or: python download_model.py           # using huggingface_hub
+./download_model.sh 4b                   # using curl
+# or: python download_model.py 4b        # using huggingface_hub
 ```
 
 **4B Base model** (~16GB, 50-step inference with CFG, higher quality):
 ```bash
-./download_model.sh --base
-# or: python download_model.py --base
+./download_model.sh 4b-base
+# or: python download_model.py 4b-base
 ```
 
-**9B Distilled model** (~30GB, higher quality, non-commercial license):
+**9B models** (~30GB, higher quality, non-commercial license):
 ```bash
-# Gated model - requires HuggingFace authentication
+# 9B models are gated - require HuggingFace authentication
 # 1. Accept the license at https://huggingface.co/black-forest-labs/FLUX.2-klein-9B
 # 2. Get a token from https://huggingface.co/settings/tokens
-./download_model.sh --9b --token YOUR_TOKEN
-# or: python download_model.py --9b --token YOUR_TOKEN
+./download_model.sh 9b --token YOUR_TOKEN       # distilled
+./download_model.sh 9b-base --token YOUR_TOKEN   # base (CFG, highest quality)
+# or: python download_model.py 9b --token YOUR_TOKEN
 # You can also set the HF_TOKEN environment variable or save
 # the token to hf_token.txt in the repo root.
 ```
 
 | Model | Directory | Size | Components |
 |-------|-----------|------|------------|
-| 4B distilled | `./flux-klein-model` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
-| 4B base | `./flux-klein-base-model` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
-| 9B distilled | `./flux-klein-9b-model` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
+| 4B distilled | `./flux-klein-4b` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
+| 4B base | `./flux-klein-4b-base` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
+| 9B distilled | `./flux-klein-9b` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
+| 9B base | `./flux-klein-9b-base` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 
 ## How Fast Is It?
 
@@ -425,13 +428,13 @@ The `--power` flag provides a middle ground: a power curve schedule (`t = 1 - (i
 
 ```bash
 # Base model with 10 steps and linear schedule
-./flux -d flux-klein-base-model -p "a cat" -o cat.png -s 10 --linear
+./flux -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --linear
 
 # Base model with power schedule (quadratic by default)
-./flux -d flux-klein-base-model -p "a cat" -o cat.png -s 10 --power
+./flux -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --power
 
 # Power schedule with custom exponent
-./flux -d flux-klein-base-model -p "a cat" -o cat.png -s 10 --power-alpha 1.5
+./flux -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --power-alpha 1.5
 ```
 
 In interactive CLI mode, toggle with `!linear` or `!power [alpha]`.
@@ -485,8 +488,8 @@ The text encoder is automatically released after encoding, reducing peak memory 
 Memory-mapped weight loading is enabled by default. Use `--no-mmap` to disable and load all weights upfront.
 
 ```bash
-./flux -d flux-klein-model -p "A cat" -o cat.png           # mmap (default)
-./flux -d flux-klein-model -p "A cat" -o cat.png --no-mmap # load all upfront
+./flux -d flux-klein-4b -p "A cat" -o cat.png           # mmap (default)
+./flux -d flux-klein-4b -p "A cat" -o cat.png --no-mmap # load all upfront
 ```
 
 **How it works:** Instead of loading all model weights into RAM upfront, mmap keeps the safetensors files memory-mapped and loads weights on-demand:
@@ -518,7 +521,7 @@ Here's a complete program that generates an image from a text prompt:
 
 int main(void) {
     /* Load the model. This loads VAE, transformer, and text encoder. */
-    flux_ctx *ctx = flux_load_dir("flux-klein-model");
+    flux_ctx *ctx = flux_load_dir("flux-klein-4b");
     if (!ctx) {
         fprintf(stderr, "Failed to load model: %s\n", flux_get_error());
         return 1;
@@ -564,7 +567,7 @@ Transform an existing image guided by a text prompt using in-context conditionin
 #include <stdio.h>
 
 int main(void) {
-    flux_ctx *ctx = flux_load_dir("flux-klein-model");
+    flux_ctx *ctx = flux_load_dir("flux-klein-4b");
     if (!ctx) return 1;
 
     /* Load the input image */
@@ -604,7 +607,7 @@ int main(void) {
 When generating multiple images with different seeds but the same prompt, you can avoid reloading the text encoder:
 
 ```c
-flux_ctx *ctx = flux_load_dir("flux-klein-model");
+flux_ctx *ctx = flux_load_dir("flux-klein-4b");
 flux_params params = FLUX_PARAMS_DEFAULT;
 params.width = 256;
 params.height = 256;
@@ -719,7 +722,7 @@ This saves to `/tmp/`:
 
 4. Run C with the same inputs:
 ```bash
-./flux -d flux-klein-model --debug-py -W 256 -H 256 --steps 4 -o /tmp/c_debug.png
+./flux -d flux-klein-4b --debug-py -W 256 -H 256 --steps 4 -o /tmp/c_debug.png
 ```
 
 5. Compare the outputs visually or numerically.

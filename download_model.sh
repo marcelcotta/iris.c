@@ -1,29 +1,69 @@
 #!/bin/bash
 set -e
 
-# Default: distilled 4B model. Use --base for base model, --9b for 9B model.
-REPO="FLUX.2-klein-4B"
-OUT="./flux-klein-model"
-TOKEN=""
+show_usage() {
+    echo "FLUX.2-klein Model Downloader"
+    echo ""
+    echo "Usage: $0 MODEL [--token TOKEN]"
+    echo ""
+    echo "Available models:"
+    echo ""
+    echo "  4b        Distilled 4B (4 steps, fast, ~16 GB)"
+    echo "  4b-base   Base 4B (50 steps, CFG, higher quality, ~16 GB)"
+    echo "  9b        Distilled 9B (4 steps, higher quality, non-commercial, ~30 GB)"
+    echo "  9b-base   Base 9B (50 steps, CFG, highest quality, non-commercial, ~30 GB)"
+    echo ""
+    echo "If this is your first time, we suggest downloading the \"4b\" model:"
+    echo "  $0 4b"
+    exit 1
+}
 
-# Parse arguments
+# Need at least one argument
+if [ $# -lt 1 ]; then
+    show_usage
+fi
+
+# First positional argument is the model name
+MODEL="$1"
+shift
+
+# Map model name to repo and output directory
+case "$MODEL" in
+    4b)
+        REPO="FLUX.2-klein-4B"
+        OUT="./flux-klein-4b"
+        ;;
+    4b-base)
+        REPO="FLUX.2-klein-base-4B"
+        OUT="./flux-klein-4b-base"
+        ;;
+    9b)
+        REPO="FLUX.2-klein-9B"
+        OUT="./flux-klein-9b"
+        ;;
+    9b-base)
+        REPO="FLUX.2-klein-base-9B"
+        OUT="./flux-klein-9b-base"
+        ;;
+    *)
+        echo "Unknown model: $MODEL"
+        echo ""
+        show_usage
+        ;;
+esac
+
+# Parse remaining arguments
+TOKEN=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --base)
-            REPO="FLUX.2-klein-base-4B"
-            OUT="./flux-klein-base-model"
-            ;;
-        --9b)
-            REPO="FLUX.2-klein-9B"
-            OUT="./flux-klein-9b-model"
-            ;;
         --token)
             TOKEN="$2"
             shift
             ;;
         *)
-            echo "Usage: $0 [--base] [--9b] [--token TOKEN]"
-            exit 1
+            echo "Unknown option: $1"
+            echo ""
+            show_usage
             ;;
     esac
     shift
@@ -58,7 +98,7 @@ dl() {
         echo "If this is a gated model, you need a HuggingFace token:"
         echo "  1. Accept the license at https://huggingface.co/black-forest-labs/$REPO"
         echo "  2. Get your token from https://huggingface.co/settings/tokens"
-        echo "  3. Run: $0 --token YOUR_TOKEN"
+        echo "  3. Run: $0 $MODEL --token YOUR_TOKEN"
         echo "  Or set HF_TOKEN env var, or save token to hf_token.txt"
         exit 1
     fi

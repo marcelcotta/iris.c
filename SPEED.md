@@ -9,8 +9,8 @@
 - **Before committing**: run `make test` to verify no regressions
 - **Benchmark command**:
   ```bash
-  ./flux -d flux-klein-model -p "A woman wearing sunglasses" -o /tmp/bench.png -W 256 -H 256 -v --seed 42
-  ./flux -d flux-klein-model -p "A woman wearing sunglasses" -o /tmp/bench.png -W 512 -H 512 -v --seed 42
+  ./flux -d flux-klein-4b -p "A woman wearing sunglasses" -o /tmp/bench.png -W 256 -H 256 -v --seed 42
+  ./flux -d flux-klein-4b -p "A woman wearing sunglasses" -o /tmp/bench.png -W 512 -H 512 -v --seed 42
   ```
 
 ## Pipeline

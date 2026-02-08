@@ -1,10 +1,11 @@
 This is a C implementation of the Flux.2 Klein model, an image synthesis model
 created by Black Forest Labs, supporting both 4B and 9B parameter variants.
 
-Three model variants are supported:
-- **4B Distilled** (flux-klein-model): 4 steps, no CFG, fast.
-- **4B Base** (flux-klein-base-model): 50 steps default, Classifier-Free Guidance (CFG), higher quality but ~25x slower.
-- **9B Distilled** (flux-klein-9b-model): 4 steps, larger model, higher quality. Non-commercial license.
+Four model variants are supported:
+- **4B Distilled** (flux-klein-4b): 4 steps, no CFG, fast.
+- **4B Base** (flux-klein-4b-base): 50 steps default, Classifier-Free Guidance (CFG), higher quality but ~25x slower.
+- **9B Distilled** (flux-klein-9b): 4 steps, larger model, higher quality. Non-commercial license.
+- **9B Base** (flux-klein-9b-base): 50 steps default, CFG, highest quality. Non-commercial license.
 
 All share the same architecture (rectified flow transformer) with different dimensions. Architecture parameters are read at runtime from the model's config JSON files (`transformer/config.json` and `text_encoder/config.json`). The model type is autodetected from `model_index.json` and the transformer config. The `--base` CLI flag can force base mode.
 
@@ -98,11 +99,12 @@ This project implements three different targets:
 
 # How to run the project
 
-    ./flux2 -d flux-klein-model -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux2 -d flux-klein-base-model -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux2 -d flux-klein-9b-model -p "a cat and a dog playing" -o /tmp/test.png
+    ./flux2 -d flux-klein-4b -p "a cat and a dog playing" -o /tmp/test.png
+    ./flux2 -d flux-klein-4b-base -p "a cat and a dog playing" -o /tmp/test.png
+    ./flux2 -d flux-klein-9b -p "a cat and a dog playing" -o /tmp/test.png
+    ./flux2 -d flux-klein-9b-base -p "a cat and a dog playing" -o /tmp/test.png
 
-You have your weights ready in `flux-klein-model` (distilled), `flux-klein-base-model` (base), and `flux-klein-9b-model` (9B distilled). If you can't find them, there is a download script (`--base` for the base model, `--9b` for the 9B model), but before using it ask the user.
+You have your weights ready in `flux-klein-4b` (4B distilled), `flux-klein-4b-base` (4B base), `flux-klein-9b` (9B distilled), and `flux-klein-9b-base` (9B base). If you can't find them, there is a download script, but before using it ask the user.
 
 # Where to find the reference implementation in Python
 
@@ -207,7 +209,7 @@ make test
 
 Manual verification:
 ```bash
-./flux2 -d flux-klein-model -p "A fluffy orange cat sitting on a windowsill" \
+./flux2 -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" \
   --seed 42 --steps 2 -o /tmp/test.png -W 64 -H 64
 
 python3 -c "
