@@ -43,8 +43,8 @@ extern flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
 extern float *flux_image_to_tensor(const flux_image *img);
 
 extern flux_transformer_t *flux_transformer_load(FILE *f);
-extern flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf);
-extern flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf);
+extern flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, const char *model_dir);
+extern flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf, const char *model_dir);
 extern void flux_transformer_free(flux_transformer_t *tf);
 extern float *flux_transformer_forward(flux_transformer_t *tf,
                                         const float *img_latent, int img_h, int img_w,
@@ -141,6 +141,8 @@ struct flux_ctx {
     int default_steps;
     float default_guidance;
     int is_distilled;  /* 1 = distilled (4-step), 0 = base (50-step CFG) */
+    int text_dim;      /* Text embedding dimension (7680 for 4B, varies for 9B) */
+    int is_non_commercial; /* 1 if model has non-commercial license (9B) */
 
     /* Model info */
     char model_name[64];
@@ -212,14 +214,46 @@ flux_ctx *flux_load_dir(const char *model_dir) {
         }
     }
 
+    /* Read transformer/config.json to determine model size (4B vs 9B)
+     * and text embedding dimension. */
+    int num_heads = 24;  /* default 4B */
+    ctx->text_dim = 7680;  /* default 4B: 3 * 2560 */
+    snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
+    if (file_exists(path)) {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char buf[4096];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            buf[n] = '\0';
+            fclose(f);
+            char *p;
+            if ((p = strstr(buf, "\"num_attention_heads\""))) {
+                if ((p = strchr(p, ':'))) num_heads = atoi(p + 1);
+            }
+            int joint_dim = 0;
+            if ((p = strstr(buf, "\"joint_attention_dim\""))) {
+                if ((p = strchr(p, ':'))) joint_dim = atoi(p + 1);
+            }
+            if (joint_dim > 0) ctx->text_dim = joint_dim;
+        }
+    }
+
+    /* Determine model variant name based on architecture size.
+     * 4B: 24 heads (hidden=3072), 9B: more heads (hidden>3072). */
+    int hidden_size = num_heads * 128;  /* head_dim is always 128 */
+    const char *size_label = (hidden_size > 3072) ? "9B" : "4B";
+    ctx->is_non_commercial = (hidden_size > 3072) ? 1 : 0;
+
     if (ctx->is_distilled) {
         ctx->default_steps = 4;
         ctx->default_guidance = 1.0f;
-        strncpy(ctx->model_name, "FLUX.2-klein-4B", sizeof(ctx->model_name) - 1);
+        snprintf(ctx->model_name, sizeof(ctx->model_name),
+                 "FLUX.2-klein-%s", size_label);
     } else {
         ctx->default_steps = 50;
         ctx->default_guidance = 4.0f;
-        strncpy(ctx->model_name, "FLUX.2-klein-base-4B", sizeof(ctx->model_name) - 1);
+        snprintf(ctx->model_name, sizeof(ctx->model_name),
+                 "FLUX.2-klein-base-%s", size_label);
     }
 
     /* Load VAE only at startup (~300MB).
@@ -280,7 +314,9 @@ void flux_set_base_mode(flux_ctx *ctx) {
     ctx->is_distilled = 0;
     ctx->default_steps = 50;
     ctx->default_guidance = 4.0f;
-    strncpy(ctx->model_name, "FLUX.2-klein-base-4B", sizeof(ctx->model_name) - 1);
+    const char *size_label = ctx->is_non_commercial ? "9B" : "4B";
+    snprintf(ctx->model_name, sizeof(ctx->model_name),
+             "FLUX.2-klein-base-%s", size_label);
 }
 
 void flux_release_text_encoder(flux_ctx *ctx) {
@@ -310,9 +346,9 @@ static int flux_load_transformer_if_needed(flux_ctx *ctx) {
         if (ctx->use_mmap) {
             /* Mmap mode: load only small weights, keep sf open for on-demand loading.
              * The transformer takes ownership of sf and will close it on free. */
-            ctx->transformer = flux_transformer_load_safetensors_mmap(sf);
+            ctx->transformer = flux_transformer_load_safetensors_mmap(sf, ctx->model_dir);
         } else {
-            ctx->transformer = flux_transformer_load_safetensors(sf);
+            ctx->transformer = flux_transformer_load_safetensors(sf, ctx->model_dir);
             safetensors_close(sf);
         }
     }
@@ -353,7 +389,7 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
     if (!ctx->qwen3_encoder) {
         /* Return zero embeddings if encoder not available */
         *out_seq_len = QWEN3_MAX_SEQ_LEN;
-        return (float *)calloc(QWEN3_MAX_SEQ_LEN * QWEN3_TEXT_DIM, sizeof(float));
+        return (float *)calloc(QWEN3_MAX_SEQ_LEN * ctx->text_dim, sizeof(float));
     }
 
     /* Encode text using Qwen3 */
@@ -1075,6 +1111,14 @@ const char *flux_model_info(flux_ctx *ctx) {
              ctx->is_distilled ? "distilled" : "base",
              ctx->default_steps, ctx->default_guidance);
     return info;
+}
+
+int flux_text_dim(flux_ctx *ctx) {
+    return ctx ? ctx->text_dim : 7680;
+}
+
+int flux_is_non_commercial(flux_ctx *ctx) {
+    return ctx ? ctx->is_non_commercial : 0;
 }
 
 /* ========================================================================

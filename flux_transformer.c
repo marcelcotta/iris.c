@@ -284,6 +284,74 @@ typedef struct flux_transformer {
     safetensors_file_t *sf;
 } flux_transformer_t;
 
+/* ========================================================================
+ * Transformer Config Parsing
+ * ======================================================================== */
+
+/* Parse transformer/config.json to get architecture dimensions.
+ * Returns 0 on success, -1 on failure (caller should use defaults). */
+static int parse_transformer_config(const char *model_dir, flux_transformer_t *tf) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    /* Simple JSON integer/float extraction.
+     * Look for "key": value patterns. */
+    char *p;
+    int num_heads = 0, head_dim = 0, num_layers = 0, num_single = 0;
+    int joint_attention_dim = 0, in_channels = 0;
+    float mlp_ratio = 0, rope_theta = 0;
+
+    if ((p = strstr(buf, "\"num_attention_heads\""))) {
+        if ((p = strchr(p, ':'))) num_heads = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"attention_head_dim\""))) {
+        if ((p = strchr(p, ':'))) head_dim = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"num_layers\""))) {
+        if ((p = strchr(p, ':'))) num_layers = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"num_single_layers\""))) {
+        if ((p = strchr(p, ':'))) num_single = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"joint_attention_dim\""))) {
+        if ((p = strchr(p, ':'))) joint_attention_dim = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"in_channels\""))) {
+        if ((p = strchr(p, ':'))) in_channels = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"mlp_ratio\""))) {
+        if ((p = strchr(p, ':'))) mlp_ratio = atof(p + 1);
+    }
+    if ((p = strstr(buf, "\"rope_theta\""))) {
+        if ((p = strchr(p, ':'))) rope_theta = atof(p + 1);
+    }
+
+    /* Validate: we need at least heads and head_dim */
+    if (num_heads <= 0 || head_dim <= 0) return -1;
+
+    tf->num_heads = num_heads;
+    tf->head_dim = head_dim;
+    tf->hidden_size = num_heads * head_dim;
+    tf->mlp_hidden = (int)(tf->hidden_size * (mlp_ratio > 0 ? mlp_ratio : 3.0f));
+    tf->num_double_layers = num_layers > 0 ? num_layers : 5;
+    tf->num_single_layers = num_single > 0 ? num_single : 20;
+    tf->text_dim = joint_attention_dim > 0 ? joint_attention_dim : 7680;
+    tf->latent_channels = in_channels > 0 ? in_channels : 128;
+    tf->rope_theta = rope_theta > 0 ? rope_theta : 2000.0f;
+    tf->rope_dim = head_dim;
+    tf->axis_dim = head_dim / 4;  /* 4 RoPE axes */
+
+    return 0;
+}
+
 /* Forward declarations */
 void flux_transformer_free(flux_transformer_t *tf);
 static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
@@ -4408,30 +4476,32 @@ static void warmup_bf16_weights(flux_transformer_t *tf) {
 }
 #endif /* USE_METAL */
 
-flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
+flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf, const char *model_dir) {
     flux_transformer_t *tf = calloc(1, sizeof(flux_transformer_t));
     if (!tf) return NULL;
 
     char name[256];
 
-    /* Set config based on FLUX.2-klein-4B */
-    tf->hidden_size = 3072;
-    tf->num_heads = 24;
-    tf->head_dim = 128;
-    tf->mlp_hidden = 9216;
-    tf->num_double_layers = 5;
-    tf->num_single_layers = 20;
-    tf->text_dim = 7680;
-    tf->latent_channels = 128;
+    /* Parse config from transformer/config.json, fall back to 4B defaults */
+    if (parse_transformer_config(model_dir, tf) != 0) {
+        tf->hidden_size = 3072;
+        tf->num_heads = 24;
+        tf->head_dim = 128;
+        tf->mlp_hidden = 9216;
+        tf->num_double_layers = 5;
+        tf->num_single_layers = 20;
+        tf->text_dim = 7680;
+        tf->latent_channels = 128;
+        tf->rope_theta = 2000.0f;
+        tf->rope_dim = 128;
+        tf->axis_dim = 32;
+    }
     /* Max sequence length must accommodate image + text tokens combined.
      * At 1024x1024: img_seq = (1024/8)^2 = 16384, txt_seq = 512, total = 16896
      * At 1792x1792: img_seq = (1792/8)^2 = 50176, txt_seq = 512, total = 50688
      * We set 52000 to support up to 1792x1792 with margin.
      */
     tf->max_seq_len = 52000;
-    tf->rope_dim = 128;
-    tf->rope_theta = 2000.0f;
-    tf->axis_dim = 32;  /* RoPE axis dimension (head_dim = 128 = 4 * axis_dim) */
 
     /* Enable bf16 mode if Metal GPU is available */
 #ifdef USE_METAL
@@ -4656,23 +4726,25 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
 }
 
 /* Load transformer in mmap mode - only load small weights, keep sf open for block loading */
-flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf) {
+flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf, const char *model_dir) {
     flux_transformer_t *tf = calloc(1, sizeof(flux_transformer_t));
     if (!tf) return NULL;
 
-    /* Set config based on FLUX.2-klein-4B */
-    tf->hidden_size = 3072;
-    tf->num_heads = 24;
-    tf->head_dim = 128;
-    tf->mlp_hidden = 9216;
-    tf->num_double_layers = 5;
-    tf->num_single_layers = 20;
-    tf->text_dim = 7680;
-    tf->latent_channels = 128;
+    /* Parse config from transformer/config.json, fall back to 4B defaults */
+    if (parse_transformer_config(model_dir, tf) != 0) {
+        tf->hidden_size = 3072;
+        tf->num_heads = 24;
+        tf->head_dim = 128;
+        tf->mlp_hidden = 9216;
+        tf->num_double_layers = 5;
+        tf->num_single_layers = 20;
+        tf->text_dim = 7680;
+        tf->latent_channels = 128;
+        tf->rope_theta = 2000.0f;
+        tf->rope_dim = 128;
+        tf->axis_dim = 32;
+    }
     tf->max_seq_len = 52000;  /* Support up to 1792x1792 */
-    tf->rope_dim = 128;
-    tf->rope_theta = 2000.0f;
-    tf->axis_dim = 32;  /* RoPE axis dimension (head_dim = 128 = 4 * axis_dim) */
 
     /* Enable mmap mode - keep sf open, don't load block weights yet */
     tf->use_mmap = 1;

@@ -1,8 +1,8 @@
 /*
- * FLUX.2 klein 4B - Pure C Inference Engine
+ * FLUX.2 klein - Pure C Inference Engine
  *
  * A dependency-free C implementation for image synthesis using the
- * FLUX.2 klein 4B rectified flow transformer model.
+ * FLUX.2 klein rectified flow transformer model.
  *
  * Usage:
  *   flux_ctx *ctx = flux_load_dir("path/to/model");
@@ -29,16 +29,8 @@ extern "C" {
  * Configuration Constants
  * ======================================================================== */
 
-/* Model architecture (klein 4B) */
-#define FLUX_HIDDEN_SIZE        3072
-#define FLUX_NUM_HEADS          24
-#define FLUX_HEAD_DIM           128
-#define FLUX_NUM_DOUBLE_LAYERS  5
-#define FLUX_NUM_SINGLE_LAYERS  20
-#define FLUX_MLP_RATIO          3.0f
-#define FLUX_TEXT_DIM           7680
+/* Model architecture constants (same across model sizes) */
 #define FLUX_LATENT_CHANNELS    128
-#define FLUX_ROPE_THETA         2000.0f
 
 /* VAE architecture */
 #define FLUX_VAE_Z_CHANNELS     32
@@ -172,7 +164,7 @@ flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params);
 
 /*
  * Text-to-image generation with pre-computed embeddings.
- * text_emb: float array of shape [text_seq, FLUX_TEXT_DIM]
+ * text_emb: float array of shape [text_seq, text_dim]
  * text_seq: number of text tokens (typically 512)
  */
 flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
@@ -242,6 +234,16 @@ void flux_set_seed(int64_t seed);
  * Get model info string.
  */
 const char *flux_model_info(flux_ctx *ctx);
+
+/*
+ * Get text embedding dimension (7680 for 4B, varies by model).
+ */
+int flux_text_dim(flux_ctx *ctx);
+
+/*
+ * Check if model has non-commercial license (e.g., 9B model).
+ */
+int flux_is_non_commercial(flux_ctx *ctx);
 
 /*
  * Get last error message.

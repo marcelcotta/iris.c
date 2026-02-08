@@ -202,7 +202,7 @@ static double timer_end(void) {
 #define MAX_INPUT_IMAGES 16
 
 static void print_usage(const char *prog) {
-    fprintf(stderr, "FLUX.2 klein 4B - Pure C Image Generation\n\n");
+    fprintf(stderr, "FLUX.2 klein - Pure C Image Generation\n\n");
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d, --dir PATH        Path to model directory\n");
@@ -232,6 +232,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
+    fprintf(stderr, "      --no-license-info Suppress non-commercial license warning\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
@@ -279,6 +280,7 @@ int main(int argc, char *argv[]) {
         {"power",      no_argument,       0, 256},
         {"power-alpha",required_argument, 0, 257},
         {"debug-py",   no_argument,       0, 'D'},
+        {"no-license-info", no_argument, 0, 258},
         {0, 0, 0, 0}
     };
 
@@ -306,6 +308,7 @@ int main(int argc, char *argv[]) {
     int show_steps = 0;
     int debug_py = 0;
     int force_base = 0;
+    int no_license_info = 0;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
@@ -333,7 +336,7 @@ int main(int argc, char *argv[]) {
             case 'v': output_level = OUTPUT_VERBOSE; flux_verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
             case 'V':
-                fprintf(stderr, "FLUX.2 klein 4B v1.0.0\n");
+                fprintf(stderr, "FLUX.2 klein v1.0.0\n");
                 return 0;
             case 'm': use_mmap = 1; break;
             case 'M': use_mmap = 0; break;
@@ -344,6 +347,7 @@ int main(int argc, char *argv[]) {
             case 'L': params.linear_schedule = 1; break;
             case 256: params.power_schedule = 1; break;
             case 257: params.power_alpha = atof(optarg); params.power_schedule = 1; break;
+            case 258: no_license_info = 1; break;
             case 'D': debug_py = 1; break;
             default:
                 print_usage(argv[0]);
@@ -399,7 +403,7 @@ int main(int argc, char *argv[]) {
     LOG_NORMAL("Seed: %lld\n", (long long)actual_seed);
 
     /* Verbose header */
-    LOG_VERBOSE("FLUX.2 klein 4B Image Generator\n");
+    LOG_VERBOSE("FLUX.2 klein Image Generator\n");
     LOG_VERBOSE("================================\n");
     LOG_VERBOSE("Model: %s\n", model_dir);
     if (prompt) LOG_VERBOSE("Prompt: %s\n", prompt);
@@ -447,6 +451,16 @@ int main(int argc, char *argv[]) {
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
     LOG_NORMAL("Model: %s\n", flux_model_info(ctx));
+
+    /* Non-commercial license warning for 9B model */
+    if (flux_is_non_commercial(ctx) && !no_license_info) {
+        fprintf(stderr,
+            "\nNOTE: This model is released under a NON COMMERCIAL LICENSE.\n"
+            "The output can only be used under the terms of the\n"
+            "FLUX non-commercial license:\n"
+            "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/blob/main/LICENSE.md\n"
+            "(use --no-license-info to suppress this message)\n\n");
+    }
 
     /* Interactive mode: start REPL */
     if (interactive_mode) {
@@ -530,7 +544,7 @@ int main(int argc, char *argv[]) {
         long file_size = ftell(emb_file);
         fseek(emb_file, 0, SEEK_SET);
 
-        int text_dim = FLUX_TEXT_DIM;
+        int text_dim = flux_text_dim(ctx);
         int text_seq = file_size / (text_dim * sizeof(float));
 
         float *text_emb = (float *)malloc(file_size);

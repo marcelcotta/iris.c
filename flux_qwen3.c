@@ -38,6 +38,9 @@
  * Fixes issue #9: SIGKILL on 16GB Metal systems during text encoding. */
 #define QWEN3_MIN_GPU_ELEMENTS (10 * 1024 * 1024)
 
+/* Maximum number of safetensors shards (Qwen3-8B may have >2) */
+#define QWEN3_MAX_SHARDS 16
+
 /* ========================================================================
  * Data Structures
  * ======================================================================== */
@@ -79,8 +82,18 @@ typedef struct {
 } qwen3_layer_t;
 
 struct qwen3_model {
+    /* Architecture (from config.json) */
+    int hidden_size;
+    int intermediate_size;
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int vocab_size;
+    float rope_theta;
+    int text_dim;             /* 3 * hidden_size */
+
     /* Embedding layer */
-    float *embed_tokens;      /* [vocab_size, hidden] = [151936, 2560] */
+    float *embed_tokens;      /* [vocab_size, hidden] */
 
     /* Transformer layers */
     qwen3_layer_t *layers;    /* [num_layers] */
@@ -117,7 +130,8 @@ struct qwen3_model {
 
     /* Mmap mode: keep safetensors files open, load layer weights on-demand */
     int use_mmap;
-    safetensors_file_t *sf_files[2];
+    safetensors_file_t *sf_files[QWEN3_MAX_SHARDS];
+    int num_sf_files;
 
     /* BF16 GPU acceleration */
     int use_bf16;
@@ -312,10 +326,10 @@ static void apply_rope(float *q, float *k, const float *cos_cache, const float *
 
 static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
                                     int seq_len, const int *attention_mask) {
-    int num_heads = QWEN3_NUM_HEADS;
-    int num_kv_heads = QWEN3_NUM_KV_HEADS;
-    int head_dim = QWEN3_HEAD_DIM;
-    int hidden = QWEN3_HIDDEN_SIZE;
+    int num_heads = model->num_heads;
+    int num_kv_heads = model->num_kv_heads;
+    int head_dim = model->head_dim;
+    int hidden = model->hidden_size;
     int kv_dim = num_kv_heads * head_dim;
     int q_dim = num_heads * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -456,8 +470,8 @@ output_proj:
  * ======================================================================== */
 
 static void qwen3_mlp_forward(qwen3_model_t *model, qwen3_layer_t *layer, int seq_len) {
-    int hidden = QWEN3_HIDDEN_SIZE;
-    int intermediate = QWEN3_INTERMEDIATE_SIZE;
+    int hidden = model->hidden_size;
+    int intermediate = model->intermediate_size;
 
     /* Gate and Up projections */
     qwen3_linear(model->mlp_gate, model->norm_buf, layer->mlp.gate_proj_weight,
@@ -483,7 +497,7 @@ static void qwen3_mlp_forward(qwen3_model_t *model, qwen3_layer_t *layer, int se
 
 static void qwen3_layer_forward(qwen3_model_t *model, qwen3_layer_t *layer,
                                 int seq_len, const int *attention_mask) {
-    int hidden = QWEN3_HIDDEN_SIZE;
+    int hidden = model->hidden_size;
 
     /* Save residual */
     memcpy(model->residual, model->hidden_state, seq_len * hidden * sizeof(float));
@@ -563,8 +577,8 @@ static flux_gpu_tensor_t bf16_ptr_to_bf16_tensor(const uint16_t *bf16_data, int 
 
 /* GPU-accelerated MLP using bf16 weights */
 static void qwen3_mlp_forward_bf16(qwen3_model_t *model, qwen3_layer_t *layer, int seq_len) {
-    int hidden = QWEN3_HIDDEN_SIZE;
-    int intermediate = QWEN3_INTERMEDIATE_SIZE;
+    int hidden = model->hidden_size;
+    int intermediate = model->intermediate_size;
     int n = seq_len * intermediate;
 
     /* Convert input to bf16 tensor on GPU */
@@ -610,10 +624,10 @@ static void qwen3_mlp_forward_bf16(qwen3_model_t *model, qwen3_layer_t *layer, i
 /* GPU-accelerated attention using bf16 weights for projections */
 static void qwen3_attention_forward_bf16(qwen3_model_t *model, qwen3_layer_t *layer,
                                           int seq_len, const int *attention_mask) {
-    int num_heads = QWEN3_NUM_HEADS;
-    int num_kv_heads = QWEN3_NUM_KV_HEADS;
-    int head_dim = QWEN3_HEAD_DIM;
-    int hidden = QWEN3_HIDDEN_SIZE;
+    int num_heads = model->num_heads;
+    int num_kv_heads = model->num_kv_heads;
+    int head_dim = model->head_dim;
+    int hidden = model->hidden_size;
     int kv_dim = num_kv_heads * head_dim;
     int q_dim = num_heads * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -751,7 +765,7 @@ static void qwen3_attention_forward_bf16(qwen3_model_t *model, qwen3_layer_t *la
 /* GPU-accelerated layer forward */
 static void qwen3_layer_forward_bf16(qwen3_model_t *model, qwen3_layer_t *layer,
                                       int seq_len, const int *attention_mask) {
-    int hidden = QWEN3_HIDDEN_SIZE;
+    int hidden = model->hidden_size;
 
     /* Check if we have bf16 weights */
     if (!layer->attn.q_proj_weight_bf16 || !layer->mlp.gate_proj_weight_bf16) {
@@ -805,10 +819,10 @@ static flux_gpu_tensor_t qwen3_attention_gpu(qwen3_model_t *model,
                                               flux_gpu_tensor_t norm_out,
                                               int seq_len,
                                               const int *attention_mask) {
-    int num_heads = QWEN3_NUM_HEADS;
-    int num_kv_heads = QWEN3_NUM_KV_HEADS;
-    int head_dim = QWEN3_HEAD_DIM;
-    int hidden = QWEN3_HIDDEN_SIZE;
+    int num_heads = model->num_heads;
+    int num_kv_heads = model->num_kv_heads;
+    int head_dim = model->head_dim;
+    int hidden = model->hidden_size;
     int q_dim = num_heads * head_dim;
     int kv_dim = num_kv_heads * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -869,11 +883,11 @@ fail_qkv:
 
 /* GPU-only MLP: bf16 tensor in, bf16 tensor out.
  * Returns down projection output or NULL on failure. */
-static flux_gpu_tensor_t qwen3_mlp_gpu(qwen3_layer_t *layer,
+static flux_gpu_tensor_t qwen3_mlp_gpu(qwen3_model_t *model, qwen3_layer_t *layer,
                                          flux_gpu_tensor_t norm_out,
                                          int seq_len) {
-    int hidden = QWEN3_HIDDEN_SIZE;
-    int intermediate = QWEN3_INTERMEDIATE_SIZE;
+    int hidden = model->hidden_size;
+    int intermediate = model->intermediate_size;
 
     flux_gpu_tensor_t gate = flux_gpu_linear_bf16_native(norm_out, layer->mlp.gate_proj_weight_bf16,
                                                           seq_len, hidden, intermediate);
@@ -900,7 +914,7 @@ static flux_gpu_tensor_t qwen3_mlp_gpu(qwen3_layer_t *layer,
  * Only processes layers 0..26 (layers 27-35 are unused by output).
  * Returns 1 on success, 0 on failure. */
 static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *attention_mask) {
-    int hidden = QWEN3_HIDDEN_SIZE;
+    int hidden = model->hidden_size;
 
     /* Upload hidden state to GPU as bf16 */
     flux_gpu_batch_begin();
@@ -929,11 +943,10 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
 
         /* Load weights on demand (mmap mode) */
         if (model->use_mmap) {
-            safetensors_file_t *files[2] = {model->sf_files[0], model->sf_files[1]};
-            if (load_layer_weights_small_f32(layer, files, 2, layer_idx) != 0) {
+            if (load_layer_weights_small_f32(layer, model->sf_files, model->num_sf_files, layer_idx) != 0) {
                 ok = 0; break;
             }
-            load_layer_weights_bf16(layer, files, 2, layer_idx);
+            load_layer_weights_bf16(layer, model->sf_files, model->num_sf_files, layer_idx);
         }
 
         if (!layer->attn.q_proj_weight_bf16 || !layer->mlp.gate_proj_weight_bf16) {
@@ -972,7 +985,7 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
         flux_gpu_tensor_free(post_norm_w);
 
         /* MLP */
-        flux_gpu_tensor_t mlp_out = qwen3_mlp_gpu(layer, norm_out, seq_len);
+        flux_gpu_tensor_t mlp_out = qwen3_mlp_gpu(model, layer, norm_out, seq_len);
         flux_gpu_tensor_free(norm_out);
         if (!mlp_out) { ok = 0; break; }
 
@@ -1040,13 +1053,13 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
 
 float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
                      const int *attention_mask, int seq_len) {
-    int hidden = QWEN3_HIDDEN_SIZE;
+    int hidden = model->hidden_size;
     float *output;
 
     /* Embedding lookup */
     for (int s = 0; s < seq_len; s++) {
         int token_id = input_ids[s];
-        if (token_id >= 0 && token_id < QWEN3_VOCAB_SIZE) {
+        if (token_id >= 0 && token_id < model->vocab_size) {
             memcpy(model->hidden_state + s * hidden,
                    model->embed_tokens + token_id * hidden,
                    hidden * sizeof(float));
@@ -1076,22 +1089,21 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     for (int layer_idx = 0; layer_idx < model->num_layers; layer_idx++) {
         /* In mmap mode, load layer weights on-demand */
         if (model->use_mmap) {
-            safetensors_file_t *files[2] = {model->sf_files[0], model->sf_files[1]};
 #ifdef USE_METAL
             if (model->use_bf16) {
                 /* Load only small f32 weights (layer norms) + bf16 projection weights */
-                if (load_layer_weights_small_f32(&model->layers[layer_idx], files, 2, layer_idx) != 0) {
+                if (load_layer_weights_small_f32(&model->layers[layer_idx], model->sf_files, model->num_sf_files, layer_idx) != 0) {
                     fprintf(stderr, "Failed to load layer %d small weights\n", layer_idx);
 #ifdef USE_METAL
                     if (batch_mode) flux_gpu_batch_end();
 #endif
                     return NULL;
                 }
-                load_layer_weights_bf16(&model->layers[layer_idx], files, 2, layer_idx);
+                load_layer_weights_bf16(&model->layers[layer_idx], model->sf_files, model->num_sf_files, layer_idx);
             } else
 #endif
             {
-                if (load_layer_weights(&model->layers[layer_idx], files, 2, layer_idx) != 0) {
+                if (load_layer_weights(&model->layers[layer_idx], model->sf_files, model->num_sf_files, layer_idx) != 0) {
                     fprintf(stderr, "Failed to load layer %d weights\n", layer_idx);
                     return NULL;
                 }
@@ -1137,17 +1149,18 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 #ifdef USE_METAL
 concatenate: (void)0; /* label needs a statement; can't precede a declaration in C */
 #endif
-    output = malloc(seq_len * QWEN3_TEXT_DIM * sizeof(float));
+    int text_dim = model->text_dim;
+    output = malloc(seq_len * text_dim * sizeof(float));
     if (!output) return NULL;
 
     for (int s = 0; s < seq_len; s++) {
-        memcpy(output + s * QWEN3_TEXT_DIM,
+        memcpy(output + s * text_dim,
                model->layer_outputs[0] + s * hidden,
                hidden * sizeof(float));
-        memcpy(output + s * QWEN3_TEXT_DIM + hidden,
+        memcpy(output + s * text_dim + hidden,
                model->layer_outputs[1] + s * hidden,
                hidden * sizeof(float));
-        memcpy(output + s * QWEN3_TEXT_DIM + 2 * hidden,
+        memcpy(output + s * text_dim + 2 * hidden,
                model->layer_outputs[2] + s * hidden,
                hidden * sizeof(float));
     }
@@ -1326,75 +1339,173 @@ static void free_layer_weights(qwen3_layer_t *layer) {
     memset(layer, 0, sizeof(*layer));
 }
 
-qwen3_model_t *qwen3_model_load(const char *model_dir) {
-    qwen3_model_t *model = calloc(1, sizeof(qwen3_model_t));
-    if (!model) return NULL;
+/* ========================================================================
+ * Qwen3 Config Parsing and Dynamic Shard Loading
+ * ======================================================================== */
 
-    model->num_layers = QWEN3_NUM_LAYERS;
-    model->layers = calloc(model->num_layers, sizeof(qwen3_layer_t));
-    if (!model->layers) {
-        free(model);
-        return NULL;
+/* Parse text_encoder/config.json to get architecture dimensions.
+ * Sets model fields. Returns 0 on success, -1 on failure. */
+static int parse_qwen3_config(const char *model_dir, qwen3_model_t *model) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/config.json", model_dir);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    char *p;
+    int hidden = 0, intermediate = 0, num_heads = 0, num_kv_heads = 0;
+    int head_dim = 0, vocab_size = 0, num_layers = 0;
+    float rope_theta = 0;
+
+    if ((p = strstr(buf, "\"hidden_size\""))) {
+        if ((p = strchr(p, ':'))) hidden = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"intermediate_size\""))) {
+        if ((p = strchr(p, ':'))) intermediate = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"num_attention_heads\""))) {
+        if ((p = strchr(p, ':'))) num_heads = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"num_key_value_heads\""))) {
+        if ((p = strchr(p, ':'))) num_kv_heads = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"head_dim\""))) {
+        if ((p = strchr(p, ':'))) head_dim = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"vocab_size\""))) {
+        if ((p = strchr(p, ':'))) vocab_size = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"num_hidden_layers\""))) {
+        if ((p = strchr(p, ':'))) num_layers = atoi(p + 1);
+    }
+    if ((p = strstr(buf, "\"rope_theta\""))) {
+        if ((p = strchr(p, ':'))) rope_theta = atof(p + 1);
     }
 
-    /* Open safetensors files */
+    if (hidden <= 0 || num_heads <= 0) return -1;
+
+    model->hidden_size = hidden;
+    model->intermediate_size = intermediate > 0 ? intermediate : 9728;
+    model->num_heads = num_heads;
+    model->num_kv_heads = num_kv_heads > 0 ? num_kv_heads : 8;
+    model->head_dim = head_dim > 0 ? head_dim : 128;
+    model->vocab_size = vocab_size > 0 ? vocab_size : QWEN3_VOCAB_SIZE;
+    model->num_layers = num_layers > 0 ? num_layers : 36;
+    model->rope_theta = rope_theta > 0 ? rope_theta : QWEN3_ROPE_THETA;
+    model->text_dim = 3 * hidden;
+
+    return 0;
+}
+
+/* Set default Qwen3-4B architecture values. */
+static void qwen3_set_defaults(qwen3_model_t *model) {
+    model->hidden_size = 2560;
+    model->intermediate_size = 9728;
+    model->num_heads = 32;
+    model->num_kv_heads = 8;
+    model->head_dim = 128;
+    model->vocab_size = QWEN3_VOCAB_SIZE;
+    model->num_layers = 36;
+    model->rope_theta = QWEN3_ROPE_THETA;
+    model->text_dim = 3 * 2560;
+}
+
+/* Open all safetensors shards dynamically by reading model.safetensors.index.json.
+ * Returns number of files opened, 0 on failure. */
+static int open_safetensors_shards(const char *model_dir,
+                                    safetensors_file_t **files, int max_files) {
+    char path[1024];
+
+    /* First try: read the index JSON to discover shard filenames */
+    snprintf(path, sizeof(path), "%s/model.safetensors.index.json", model_dir);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        /* Read the whole index file */
+        fseek(f, 0, SEEK_END);
+        long fsize = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char *buf = malloc(fsize + 1);
+        if (!buf) { fclose(f); return 0; }
+        fread(buf, 1, fsize, f);
+        buf[fsize] = '\0';
+        fclose(f);
+
+        /* Collect unique shard filenames from weight_map values.
+         * They look like: "model-00001-of-00003.safetensors" */
+        char shard_names[QWEN3_MAX_SHARDS][128];
+        int num_shards = 0;
+
+        char *p = buf;
+        while ((p = strstr(p, "model-")) != NULL) {
+            /* Find the end of the filename */
+            char *end = strstr(p, ".safetensors");
+            if (!end) { p++; continue; }
+            end += strlen(".safetensors");
+
+            int len = (int)(end - p);
+            if (len >= 128) { p = end; continue; }
+
+            /* Check if we already have this shard */
+            char name[128];
+            memcpy(name, p, len);
+            name[len] = '\0';
+
+            int found = 0;
+            for (int i = 0; i < num_shards; i++) {
+                if (strcmp(shard_names[i], name) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found && num_shards < max_files && num_shards < QWEN3_MAX_SHARDS) {
+                strcpy(shard_names[num_shards], name);
+                num_shards++;
+            }
+            p = end;
+        }
+        free(buf);
+
+        if (num_shards > 0) {
+            for (int i = 0; i < num_shards; i++) {
+                snprintf(path, sizeof(path), "%s/%s", model_dir, shard_names[i]);
+                files[i] = safetensors_open(path);
+                if (!files[i]) {
+                    fprintf(stderr, "qwen3: failed to open shard %s\n", path);
+                    for (int j = 0; j < i; j++) safetensors_close(files[j]);
+                    return 0;
+                }
+            }
+            return num_shards;
+        }
+    }
+
+    /* Fallback: try model-00001-of-00002.safetensors pattern */
     char path1[512], path2[512];
     snprintf(path1, sizeof(path1), "%s/model-00001-of-00002.safetensors", model_dir);
     snprintf(path2, sizeof(path2), "%s/model-00002-of-00002.safetensors", model_dir);
 
-    safetensors_file_t *files[2];
     files[0] = safetensors_open(path1);
     files[1] = safetensors_open(path2);
+    if (files[0] && files[1]) return 2;
 
-    if (!files[0] || !files[1]) {
-        fprintf(stderr, "qwen3_model_load: failed to open safetensors files\n");
-        if (files[0]) safetensors_close(files[0]);
-        if (files[1]) safetensors_close(files[1]);
-        free(model->layers);
-        free(model);
-        return NULL;
-    }
+    if (files[0]) safetensors_close(files[0]);
+    if (files[1]) safetensors_close(files[1]);
+    return 0;
+}
 
-    /* Load embedding weights */
-    int hidden = QWEN3_HIDDEN_SIZE;
-    model->embed_tokens = load_tensor(files, 2, "model.embed_tokens.weight");
-    if (!model->embed_tokens) {
-        fprintf(stderr, "qwen3_model_load: failed to load embed_tokens\n");
-        goto error;
-    }
-
-    /* Load layer weights */
-    for (int i = 0; i < model->num_layers; i++) {
-        if (load_layer_weights(&model->layers[i], files, 2, i) != 0) {
-            fprintf(stderr, "qwen3_model_load: failed to load layer %d\n", i);
-            goto error;
-        }
-    }
-
-    /* Load final norm */
-    model->norm_weight = load_tensor(files, 2, "model.norm.weight");
-    if (!model->norm_weight) {
-        fprintf(stderr, "qwen3_model_load: failed to load final norm\n");
-        goto error;
-    }
-
-    safetensors_close(files[0]);
-    safetensors_close(files[1]);
-
-    /* Compute RoPE frequencies */
-    int max_seq = QWEN3_MAX_SEQ_LEN;
-    int half_dim = QWEN3_HEAD_DIM / 2;
-    model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
-    model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
-    compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
-                       QWEN3_HEAD_DIM, QWEN3_ROPE_THETA);
-
-    /* Allocate working memory */
+/* Allocate working memory for Qwen3 model based on architecture fields. */
+static void qwen3_alloc_work_buffers(qwen3_model_t *model) {
     int seq_len = QWEN3_MAX_SEQ_LEN;
-    int num_heads = QWEN3_NUM_HEADS;
-    int num_kv_heads = QWEN3_NUM_KV_HEADS;
-    int head_dim = QWEN3_HEAD_DIM;
-    int intermediate = QWEN3_INTERMEDIATE_SIZE;
+    int hidden = model->hidden_size;
+    int num_heads = model->num_heads;
+    int num_kv_heads = model->num_kv_heads;
+    int head_dim = model->head_dim;
+    int intermediate = model->intermediate_size;
 
     model->hidden_state = malloc(seq_len * hidden * sizeof(float));
     model->residual = malloc(seq_len * hidden * sizeof(float));
@@ -1408,7 +1519,6 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
     model->mlp_out = malloc(seq_len * hidden * sizeof(float));
     model->norm_buf = malloc(seq_len * hidden * sizeof(float));
 
-    /* Pre-allocate attention work buffers */
     model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
     model->attn_k_head_t = malloc(head_dim * seq_len * sizeof(float));
     model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
@@ -1417,12 +1527,72 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
     for (int i = 0; i < 3; i++) {
         model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
     }
+}
+
+qwen3_model_t *qwen3_model_load(const char *model_dir) {
+    qwen3_model_t *model = calloc(1, sizeof(qwen3_model_t));
+    if (!model) return NULL;
+
+    /* Parse config, fall back to defaults */
+    if (parse_qwen3_config(model_dir, model) != 0) {
+        qwen3_set_defaults(model);
+    }
+
+    model->layers = calloc(model->num_layers, sizeof(qwen3_layer_t));
+    if (!model->layers) {
+        free(model);
+        return NULL;
+    }
+
+    /* Open safetensors shards dynamically */
+    safetensors_file_t *files[QWEN3_MAX_SHARDS];
+    int num_files = open_safetensors_shards(model_dir, files, QWEN3_MAX_SHARDS);
+    if (num_files == 0) {
+        fprintf(stderr, "qwen3_model_load: failed to open safetensors files\n");
+        free(model->layers);
+        free(model);
+        return NULL;
+    }
+
+    /* Load embedding weights */
+    model->embed_tokens = load_tensor(files, num_files, "model.embed_tokens.weight");
+    if (!model->embed_tokens) {
+        fprintf(stderr, "qwen3_model_load: failed to load embed_tokens\n");
+        goto error;
+    }
+
+    /* Load layer weights */
+    for (int i = 0; i < model->num_layers; i++) {
+        if (load_layer_weights(&model->layers[i], files, num_files, i) != 0) {
+            fprintf(stderr, "qwen3_model_load: failed to load layer %d\n", i);
+            goto error;
+        }
+    }
+
+    /* Load final norm */
+    model->norm_weight = load_tensor(files, num_files, "model.norm.weight");
+    if (!model->norm_weight) {
+        fprintf(stderr, "qwen3_model_load: failed to load final norm\n");
+        goto error;
+    }
+
+    for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
+
+    /* Compute RoPE frequencies */
+    int max_seq = QWEN3_MAX_SEQ_LEN;
+    int half_dim = model->head_dim / 2;
+    model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
+    model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
+    compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
+                       model->head_dim, model->rope_theta);
+
+    /* Allocate working memory */
+    qwen3_alloc_work_buffers(model);
 
     return model;
 
 error:
-    safetensors_close(files[0]);
-    safetensors_close(files[1]);
+    for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
     qwen3_model_free(model);
     return NULL;
 }
@@ -1434,7 +1604,12 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     if (!model) return NULL;
 
     model->use_mmap = 1;
-    model->num_layers = QWEN3_NUM_LAYERS;
+
+    /* Parse config, fall back to defaults */
+    if (parse_qwen3_config(model_dir, model) != 0) {
+        qwen3_set_defaults(model);
+    }
+
 #ifdef USE_METAL
     /* Enable bf16 GPU acceleration when Metal is available.
      * Set FLUX_QWEN3_NO_BF16=1 to disable for debugging. */
@@ -1450,30 +1625,24 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
         return NULL;
     }
 
-    /* Open safetensors files and keep them open */
-    char path1[512], path2[512];
-    snprintf(path1, sizeof(path1), "%s/model-00001-of-00002.safetensors", model_dir);
-    snprintf(path2, sizeof(path2), "%s/model-00002-of-00002.safetensors", model_dir);
-
-    model->sf_files[0] = safetensors_open(path1);
-    model->sf_files[1] = safetensors_open(path2);
-
-    if (!model->sf_files[0] || !model->sf_files[1]) {
+    /* Open safetensors shards dynamically and keep them open */
+    model->num_sf_files = open_safetensors_shards(model_dir, model->sf_files, QWEN3_MAX_SHARDS);
+    if (model->num_sf_files == 0) {
         fprintf(stderr, "qwen3_model_load_mmap: failed to open safetensors files\n");
         goto error;
     }
 
-    safetensors_file_t *files[2] = {model->sf_files[0], model->sf_files[1]};
-
-    /* Load only embeddings (1.56GB) - needed for all tokens */
-    model->embed_tokens = load_tensor(files, 2, "model.embed_tokens.weight");
+    /* Load only embeddings - needed for all tokens */
+    model->embed_tokens = load_tensor(model->sf_files, model->num_sf_files,
+                                       "model.embed_tokens.weight");
     if (!model->embed_tokens) {
         fprintf(stderr, "qwen3_model_load_mmap: failed to load embed_tokens\n");
         goto error;
     }
 
     /* Load final norm (small) */
-    model->norm_weight = load_tensor(files, 2, "model.norm.weight");
+    model->norm_weight = load_tensor(model->sf_files, model->num_sf_files,
+                                      "model.norm.weight");
     if (!model->norm_weight) {
         fprintf(stderr, "qwen3_model_load_mmap: failed to load final norm\n");
         goto error;
@@ -1485,39 +1654,14 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
 
     /* Compute RoPE frequencies */
     int max_seq = QWEN3_MAX_SEQ_LEN;
-    int half_dim = QWEN3_HEAD_DIM / 2;
+    int half_dim = model->head_dim / 2;
     model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
     model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
     compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
-                       QWEN3_HEAD_DIM, QWEN3_ROPE_THETA);
+                       model->head_dim, model->rope_theta);
 
-    /* Allocate working memory (same as normal mode) */
-    int seq_len = QWEN3_MAX_SEQ_LEN;
-    int hidden = QWEN3_HIDDEN_SIZE;
-    int num_heads = QWEN3_NUM_HEADS;
-    int num_kv_heads = QWEN3_NUM_KV_HEADS;
-    int head_dim = QWEN3_HEAD_DIM;
-    int intermediate = QWEN3_INTERMEDIATE_SIZE;
-
-    model->hidden_state = malloc(seq_len * hidden * sizeof(float));
-    model->residual = malloc(seq_len * hidden * sizeof(float));
-    model->q_buf = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->k_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->v_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->attn_scores = malloc(num_heads * seq_len * seq_len * sizeof(float));
-    model->attn_out = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->mlp_gate = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_up = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_out = malloc(seq_len * hidden * sizeof(float));
-    model->norm_buf = malloc(seq_len * hidden * sizeof(float));
-    model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_k_head_t = malloc(head_dim * seq_len * sizeof(float));
-    model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
-
-    for (int i = 0; i < 3; i++) {
-        model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
-    }
+    /* Allocate working memory */
+    qwen3_alloc_work_buffers(model);
 
     return model;
 
@@ -1575,8 +1719,9 @@ void qwen3_model_free(qwen3_model_t *model) {
     }
 
     /* Close mmap'd safetensors files if open */
-    if (model->sf_files[0]) safetensors_close(model->sf_files[0]);
-    if (model->sf_files[1]) safetensors_close(model->sf_files[1]);
+    for (int i = 0; i < model->num_sf_files; i++) {
+        if (model->sf_files[i]) safetensors_close(model->sf_files[i]);
+    }
 
     free(model);
 }

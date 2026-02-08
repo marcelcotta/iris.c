@@ -6,6 +6,13 @@ flux
 
 # Model weights (large files)
 flux-klein-model/
+flux-klein-base-model/
+flux-klein-9b-model/
+
+# Tokens and planning docs
+hf_token.txt
+9B.md
+AGENT.md
 
 # Misc directories (tests, images, utilities, markdown files)
 misc/

@@ -18,7 +18,7 @@
 
 #include "flux.h"
 #include "flux_kernels.h"
-#include "flux_qwen3.h"  /* For QWEN3_MAX_SEQ_LEN, QWEN3_TEXT_DIM */
+#include "flux_qwen3.h"  /* For QWEN3_MAX_SEQ_LEN */
 #include "embcache.h"
 #include "linenoise.h"
 #include "terminals.h"
@@ -395,7 +395,7 @@ static int generate_image(const char *prompt, const char *ref_image,
                 embeddings = flux_encode_text(state.ctx, prompt, &seq_len);
                 if (embeddings) {
                     emb_cache_store(prompt, embeddings,
-                                    seq_len * QWEN3_TEXT_DIM);
+                                    seq_len * flux_text_dim(state.ctx));
                     flux_release_text_encoder(state.ctx);
                     img = flux_generate_with_embeddings(state.ctx, embeddings,
                                                          seq_len, &params);
@@ -799,7 +799,7 @@ static void cmd_explore(char *arg) {
                 free(prompt_to_free);
                 return;
             }
-            emb_cache_store(prompt, embeddings, seq_len * QWEN3_TEXT_DIM);
+            emb_cache_store(prompt, embeddings, seq_len * flux_text_dim(state.ctx));
             flux_release_text_encoder(state.ctx);
         }
 
